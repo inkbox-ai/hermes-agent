@@ -683,8 +683,15 @@ class InkboxAdapter(BasePlatformAdapter):
             message_id=rfc_message_id or message.get("id"),
         )
         body_text = message.get("snippet") or subject or ""
+        # Modality marker so the LLM knows the message arrived as email
+        # (not SMS or live voice).  PLATFORM_HINTS["inkbox"] tells the
+        # agent to use this as a register cue and never echo it.
+        tagged = (
+            f"[inkbox:email from={from_address}"
+            f"{f' subject={subject!r}' if subject else ''}]\n{body_text}"
+        )
         event = MessageEvent(
-            text=body_text,
+            text=tagged,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=envelope,
@@ -712,8 +719,10 @@ class InkboxAdapter(BasePlatformAdapter):
             user_name=contact_name or remote,
             message_id=text_msg.get("id"),
         )
+        body = text_msg.get("text") or ""
+        tagged = f"[inkbox:sms from={remote}]\n{body}"
         event = MessageEvent(
-            text=text_msg.get("text") or "",
+            text=tagged,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=envelope,
@@ -799,8 +808,9 @@ class InkboxAdapter(BasePlatformAdapter):
                         chat_topic="voice_call",
                         message_id=payload.get("turn_id"),
                     )
+                    tagged = f"[inkbox:voice_call call_id={call_id}]\n{text}"
                     event = MessageEvent(
-                        text=text,
+                        text=tagged,
                         message_type=MessageType.TEXT,
                         source=source,
                         raw_message=payload,
