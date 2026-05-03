@@ -1212,6 +1212,61 @@ class InkboxAdapter(BasePlatformAdapter):
             with suppress(Exception):
                 await ws.close()
             logger.info("[Inkbox] Call WS closed: call_id=%s", call_id)
+
+            # Post-call reflection: enqueue a synthetic [call_ended] turn so
+            # the agent has a chance to do follow-up work (send promised
+            # emails, schedule callbacks, save notes, update memory).  The
+            # agent's text reply will be suppressed by the voice-grace guard
+            # in send() — only its TOOL CALLS produce side effects.  If the
+            # agent has nothing to do it can answer "[SILENT]" and the
+            # cron-style suppression delivers nothing.
+            try:
+                contact_block = self._contact_marker(meta.get("contact"))
+                tagged = (
+                    f"[inkbox:voice_call call_id={call_id} | {contact_block}]\n"
+                    "[call_ended] The call has ended. Reflect on what just "
+                    "happened and decide if any follow-up actions are "
+                    "needed:\n"
+                    "  - if you committed to anything during the call (send "
+                    "an email, schedule a callback, text a contact, save a "
+                    "note, update a contact record), perform that now via "
+                    "tool calls — execute_code/terminal for SDK actions, "
+                    "cronjob create deliver=local for delayed work, memory/"
+                    "send_message for the obvious cases.\n"
+                    "  - if there's nothing to do, reply with exactly "
+                    "[SILENT] and no other text.\n"
+                    "Note: any plain-text reply you produce here will be "
+                    "suppressed (the caller hung up — they don't want a "
+                    "trailing TTS or email containing your thoughts). "
+                    "Side effects must come from tool calls."
+                )
+                source = self.build_source(
+                    chat_id=str(contact_id),
+                    chat_name=contact_name,
+                    chat_type="dm",
+                    user_id=str(contact_id),
+                    user_name=contact_name,
+                    thread_id=call_thread_id,
+                    chat_topic="voice_call",
+                    message_id=f"call:{call_id}:ended",
+                )
+                event = MessageEvent(
+                    text=tagged,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    raw_message={"synthetic": "call_ended"},
+                    message_id=f"call:{call_id}:ended",
+                    auto_skill="inkbox-python",
+                )
+                await self._enqueue(event)
+                logger.info(
+                    "[Inkbox] Enqueued [call_ended] reflection for call_id=%s",
+                    call_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[Inkbox] Failed to enqueue call_ended event: %s", exc,
+                )
         return ws
 
     # ------------------------------------------------------------------
