@@ -86,7 +86,7 @@ computer-use = ["mcp>=1.2.0,<2"]
 inkbox = [
   # Inkbox SDK — pulls in mailboxes/contacts/identities/phone/text APIs,
   # plus inkbox.tunnels.client which hosts the tunnel data plane.
-  "inkbox>=0.3.1,<1",
+  "inkbox>=0.3.2,<1",
   # Local aiohttp server (webhook handler + WS bridge target for the SDK's
   # tunnel runtime, which forwards inbound traffic to 127.0.0.1:LISTEN_PORT).
   "aiohttp>=3.9.0,<4",

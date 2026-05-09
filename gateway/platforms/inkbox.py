@@ -159,6 +159,65 @@ def _is_hermes_admin_notice(content: str) -> bool:
     return any(s in head for s in _ADMIN_NOTICE_SUBSTRINGS)
 
 
+def _inkbox_tunnel_state_dir() -> "Path":
+    """Dedicated subdir of HERMES_HOME for the SDK's tunnel state.
+
+    The SDK writes generic-named files inside ``state_dir`` —
+    ``state.json``, ``private_key.pem``, ``cert_chain.pem`` — so we keep
+    them in their own subfolder to avoid colliding with other state files
+    Hermes itself owns under HERMES_HOME (e.g. ``state.json`` for sessions).
+    """
+    from pathlib import Path  # local — keep top-of-module import surface tight
+    from hermes_cli.config import get_hermes_home
+    return Path(get_hermes_home()) / "inkbox_tunnel"
+
+
+def _wipe_inkbox_tunnel_state(state_dir: "Path") -> None:
+    """Remove the three SDK-owned files inside ``state_dir``.
+
+    Called on every connect so a stale tunnel id / connect secret from a
+    prior run can never block the next start. The directory itself is left
+    in place; the SDK recreates contents during ``connect()``.
+    """
+    for name in ("state.json", "private_key.pem", "cert_chain.pem"):
+        path = state_dir / name
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            logger.debug(
+                "[Inkbox] Couldn't remove stale tunnel state file %s: %s",
+                path, exc,
+            )
+
+
+def _rotate_secret_by_name(inkbox_client, tunnel_name: str) -> Optional[str]:
+    """Look up an existing tunnel by name and rotate its connect_secret.
+
+    Returns the fresh secret on success, or ``None`` if no tunnel with
+    that name exists in the org. Used to recover from
+    ``TunnelSecretUnavailable`` after we wipe local state but the
+    server-side tunnel survives.
+    """
+    try:
+        tunnels = inkbox_client.tunnels.list()
+    except Exception as exc:
+        logger.warning("[Inkbox] tunnels.list() failed during rotate: %s", exc)
+        return None
+    match = next((t for t in tunnels if t.tunnel_name == tunnel_name), None)
+    if match is None:
+        return None
+    try:
+        rotated = inkbox_client.tunnels.rotate_secret(match.id)
+        return rotated.connect_secret
+    except Exception as exc:
+        logger.warning(
+            "[Inkbox] tunnels.rotate_secret(%s) failed: %s", match.id, exc,
+        )
+        return None
+
+
 def _slugify_for_tunnel(handle: str) -> str:
     """Convert an agent handle into a valid tunnel-name slug.
 
@@ -227,7 +286,8 @@ class InkboxAdapter(BasePlatformAdapter):
         self._app: Optional[Any] = None
         self._runner: Optional[Any] = None
         self._site: Optional[Any] = None
-        self._tunnel: Optional[Any] = None  # InkboxTunnel
+        self._tunnel: Optional[Any] = None  # inkbox.tunnels.client.TunnelListener
+        self._tunnel_runtime_thread: Optional["threading.Thread"] = None
         # contact_id → active call WebSocket. Used by send()/edit_message() to
         # push voice replies to the correct ongoing call.
         self._active_call_ws: Dict[str, Any] = {}
@@ -393,6 +453,13 @@ class InkboxAdapter(BasePlatformAdapter):
             with suppress(Exception):
                 await asyncio.to_thread(self._tunnel.close)
             self._tunnel = None
+        if self._tunnel_runtime_thread is not None:
+            # close() unblocks wait(); join briefly so logs flush in order.
+            with suppress(Exception):
+                await asyncio.to_thread(
+                    self._tunnel_runtime_thread.join, 5.0,
+                )
+            self._tunnel_runtime_thread = None
         if self._inkbox is not None:
             with suppress(Exception):
                 self._inkbox.close()
@@ -405,36 +472,106 @@ class InkboxAdapter(BasePlatformAdapter):
     async def _provision_inkbox_tunnel(self) -> bool:
         """Open an SDK-managed tunnel to inkboxwire.com.
 
-        The SDK's ``inkbox.tunnels.client.connect`` opens both the control
-        plane (REST registration) and the data plane (HTTP/2 stream pool to
-        the inkboxwire data-plane zone) in a single call, then returns a
-        ``TunnelListener`` whose runtime supervises the connection in its own
-        threads. State (tunnel id + connect secret) is persisted under
-        HERMES_HOME so subsequent runs reuse the same tunnel.
+        ``inkbox.tunnels.client.connect`` only does the control-plane
+        registration; the runtime thread that actually opens the h2 data
+        plane is started lazily inside ``listener.wait()``. We don't want
+        to block the gateway event loop on ``wait()``, so we spawn a small
+        background thread to drive it — which gives us a live data plane
+        plus a place to log any runtime error the listener captures.
+
+        SDK-managed state (state.json, private_key.pem, cert_chain.pem)
+        lives in a dedicated subdir of HERMES_HOME so its generic filenames
+        don't collide with Hermes' own state files. We wipe that subdir on
+        every connect so a previous run's tunnel id / connect_secret can
+        never put us in a "saved tunnel was removed server-side" loop. If
+        a same-named tunnel still exists server-side from a prior run, we
+        rotate its connect_secret (via the API key, which the wipe doesn't
+        touch) and pass the fresh one to ``connect`` — preserving the
+        public URL across restarts so patched mailbox / phone webhooks
+        don't go stale.
         """
-        from hermes_cli.config import get_hermes_home
+        import threading
+        from inkbox.tunnels.exceptions import TunnelSecretUnavailable
 
         tunnel_name = self._tunnel_name_override or _slugify_for_tunnel(
             self._identity_handle,
         )
         forward_to = f"http://127.0.0.1:{self._port}"
-        state_dir = get_hermes_home()
+        state_dir = _inkbox_tunnel_state_dir()
+
+        _wipe_inkbox_tunnel_state(state_dir)
+
+        connect_kwargs = dict(
+            name=tunnel_name,
+            forward_to=forward_to,
+            state_dir=state_dir,
+        )
 
         try:
             # ``connect`` is sync (does an HTTPS round-trip + opens the data
             # plane); offload to a thread so the gateway event loop isn't
             # blocked. The returned listener owns its own supervisor threads.
             self._tunnel = await asyncio.to_thread(
-                inkbox_tunnel_connect,
-                self._inkbox,
-                name=tunnel_name,
-                forward_to=forward_to,
-                state_dir=state_dir,
+                inkbox_tunnel_connect, self._inkbox, **connect_kwargs,
             )
+        except TunnelSecretUnavailable:
+            # The wipe removed the local connect_secret but a tunnel with
+            # this name still exists server-side. Rotate its secret with
+            # the API key and retry connect — the public URL stays stable.
+            logger.info(
+                "[Inkbox] Local secret missing for existing tunnel %r; "
+                "rotating via API and retrying.",
+                tunnel_name,
+            )
+            secret = await asyncio.to_thread(
+                _rotate_secret_by_name, self._inkbox, tunnel_name,
+            )
+            if secret is None:
+                logger.error(
+                    "[Inkbox] Couldn't rotate secret for tunnel %r — no "
+                    "matching tunnel returned by tunnels.list().",
+                    tunnel_name,
+                )
+                self._tunnel = None
+                return False
+            try:
+                self._tunnel = await asyncio.to_thread(
+                    inkbox_tunnel_connect,
+                    self._inkbox, secret=secret, **connect_kwargs,
+                )
+            except Exception:
+                logger.exception(
+                    "[Inkbox] Reconnect after secret rotation failed",
+                )
+                self._tunnel = None
+                return False
         except Exception:
             logger.exception("[Inkbox] Failed to open SDK tunnel")
             self._tunnel = None
             return False
+
+        # Drive the listener's runtime in a daemon thread. ``wait()`` calls
+        # ``_start_thread_if_needed()`` internally — that's what actually
+        # spawns the data-plane runtime thread. Without this, ``connect()``
+        # returns a listener whose runtime never starts and inkboxwire.com
+        # gets a "no agent connected" 503 for every inbound webhook.
+        def _drive_listener(listener):
+            try:
+                listener.wait()
+            except KeyboardInterrupt:
+                pass
+            except Exception:
+                logger.exception(
+                    "[Inkbox] Tunnel runtime exited with error",
+                )
+
+        self._tunnel_runtime_thread = threading.Thread(
+            target=_drive_listener,
+            args=(self._tunnel,),
+            name="inkbox-tunnel-wait",
+            daemon=True,
+        )
+        self._tunnel_runtime_thread.start()
 
         self._public_url = self._tunnel.public_url.rstrip("/")
         self._public_host = self._tunnel.tunnel.public_host

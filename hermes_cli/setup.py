@@ -1913,7 +1913,7 @@ def _setup_inkbox():
     print()
     print_info("If you don't have an Inkbox API key yet, that's totally fine —")
     print_info("we'll create a fresh agent identity for you via self-signup.")
-    has_key = prompt_yes_no("Do you already have an Inkbox API key?", True)
+    has_key = prompt_yes_no("  Do you already have an Inkbox API key?", False)
 
     api_key: str = ""
     identity = None  # AgentIdentity at the end of any branch
@@ -1990,20 +1990,20 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
     # Retry loop. Each known error class re-asks just the field at fault.
     while True:
         if not human_email:
-            human_email = prompt("Your email address (for the verification step)").strip()
+            human_email = prompt("  Your email address (for the verification step)").strip()
             if not human_email or "@" not in human_email:
                 print_error("  A valid email address is required for signup.")
                 return None, ""
 
         if not handle:
-            handle = prompt("Desired agent handle (e.g. on-call-agent, recruiting-agent)").strip()
+            handle = prompt("  Desired agent handle (e.g. on-call-agent, recruiting-agent)").strip()
             if not handle:
                 print_error("  Agent handle is required.")
                 return None, ""
 
         if local_part is None:
             local_part = prompt(
-                "Mailbox local part (e.g. 'recruiting' for recruiting@inkboxmail.com — leave empty for auto)"
+                "  Mailbox local part (e.g. 'recruiting' for recruiting@inkboxmail.com — leave empty for auto)"
             ).strip()
 
         print()
@@ -2085,10 +2085,10 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
     while True:
         attempts_left = MAX_ATTEMPTS - attempts_used
         if attempts_left <= 0:
-            prompt_text = "Type 'resend' for a new code (Ctrl+C to abort)"
+            prompt_text = "  Type 'resend' for a new code (Ctrl+C to abort)"
         else:
             prompt_text = (
-                f"Verification code, or 'resend' for a new email "
+                f"  Verification code, or 'resend' for a new email "
                 f"({attempts_left}/{MAX_ATTEMPTS} attempts left)"
             )
 
@@ -2138,15 +2138,11 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
         print_info("   We provision a *local* US number so SMS is supported")
         print_info("   (toll-free numbers don't support SMS without 10DLC/TFV).")
         if prompt_yes_no("  Provision a phone number for this agent?", True):
-            state = prompt(
-                "  US state code for the local number (e.g. CA, NY) — leave empty for any"
-            ).strip().upper() or None
             try:
                 client = Inkbox(api_key=resp.api_key, base_url=base_url)
                 provisioned_phone = client.phone_numbers.provision(
                     agent_handle=resp.agent_handle,
                     type="local",
-                    state=state,
                 )
                 print_success(f"  Provisioned: {provisioned_phone.number}")
             except InkboxAPIError as e:
@@ -2228,7 +2224,7 @@ def _inkbox_api_key_flow(
     Returns (AgentIdentity, api_key) on success, (None, "") on abort.
     """
     print()
-    api_key = prompt("Paste your Inkbox API key (ApiKey_…)", password=True).strip()
+    api_key = prompt("  Paste your Inkbox API key (ApiKey_…)", password=True).strip()
     if not api_key:
         print_error("  No key provided.")
         return None, ""
@@ -2292,6 +2288,38 @@ def _inkbox_pick_agent_scoped(client, api_key):
     return identity, api_key
 
 
+def _inkbox_mint_agent_scoped_key(client, identity, admin_key, InkboxAPIError):
+    """Mint a fresh agent-scoped API key bound to ``identity`` via the admin key.
+
+    Uses ``client.api_keys.create(scoped_identity_id=...)`` so the resulting
+    key only has authority to operate as that one agent. The caller's admin
+    key is used purely for auth on this single request and is never
+    persisted to disk — only the minted key reaches ``.env``.
+
+    Returns the new key string on success, ``None`` on failure (in which
+    case the wizard aborts rather than fall back to writing the admin key).
+    """
+    try:
+        created = client.api_keys.create(
+            label=f"Hermes gateway · {identity.agent_handle}",
+            description=(
+                "Auto-minted by `hermes setup gateway` — scoped to one "
+                "agent identity so the gateway never holds the admin "
+                "key on disk."
+            ),
+            scoped_identity_id=identity.id,
+        )
+    except InkboxAPIError as e:
+        print_error(
+            f"  Couldn't mint agent-scoped key: HTTP {e.status_code} {e.detail}"
+        )
+        return None
+    except Exception as e:
+        print_error(f"  Couldn't mint agent-scoped key: {e}")
+        return None
+    return created.api_key
+
+
 def _inkbox_pick_admin_scoped(client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError):
     """Admin-scoped key path: pick existing identity or create a new one."""
     try:
@@ -2334,12 +2362,29 @@ def _inkbox_pick_admin_scoped(client, api_key, IdentityPhoneNumberCreateOptions,
                     print_error(f"  get_identity failed: {e}")
                     return None, ""
             identity = _inkbox_offer_phone_for_existing(client, identity)
-            return identity, api_key
+            # Down-scope: replace the admin key with a fresh agent-scoped one
+            # before persisting. The admin key never lands in .env.
+            agent_key = _inkbox_mint_agent_scoped_key(
+                client, identity, api_key, InkboxAPIError,
+            )
+            if agent_key is None:
+                return None, ""
+            return identity, agent_key
         # Fall through to create-new
     else:
         print_info("  No identities exist yet under this org. Let's create the first one.")
 
-    return _inkbox_create_identity(client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError)
+    identity, _ = _inkbox_create_identity(
+        client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError,
+    )
+    if identity is None:
+        return None, ""
+    agent_key = _inkbox_mint_agent_scoped_key(
+        client, identity, api_key, InkboxAPIError,
+    )
+    if agent_key is None:
+        return None, ""
+    return identity, agent_key
 
 
 def _inkbox_create_identity(client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError):
@@ -2348,18 +2393,18 @@ def _inkbox_create_identity(client, api_key, IdentityPhoneNumberCreateOptions, I
     print_header("Create new agent identity")
 
     while True:
-        handle = prompt("Agent handle (e.g. on-call-agent, recruiting-agent)").strip()
+        handle = prompt("  Agent handle (e.g. on-call-agent, recruiting-agent)").strip()
         if not handle:
             print_error("  Handle is required.")
             continue
         break
 
     local_part = prompt(
-        "Mailbox local part (e.g. 'recruiting' for recruiting@inkboxmail.com — leave empty for auto)"
+        "  Mailbox local part (e.g. 'recruiting' for recruiting@inkboxmail.com — leave empty for auto)"
     ).strip()
 
     display_name = prompt(
-        "Display name for the mailbox (shown to recipients, optional)"
+        "  Display name for the mailbox (shown to recipients, optional)"
     ).strip()
 
     print()
@@ -2370,12 +2415,8 @@ def _inkbox_create_identity(client, api_key, IdentityPhoneNumberCreateOptions, I
 
     phone_opts = None
     if create_phone:
-        state = prompt(
-            "  US state code for the local number (e.g. CA, NY) — leave empty for any"
-        ).strip().upper() or None
         phone_opts = IdentityPhoneNumberCreateOptions(
             type="local",
-            state=state,
             incoming_call_action="auto_reject",  # adapter overrides at runtime
         )
 
@@ -2396,12 +2437,12 @@ def _inkbox_create_identity(client, api_key, IdentityPhoneNumberCreateOptions, I
             # Common case: handle or mailbox already taken.
             detail_lc = (str(e.detail) or "").lower()
             if "handle" in detail_lc and "taken" in detail_lc:
-                handle = prompt("Pick a different handle").strip()
+                handle = prompt("  Pick a different handle").strip()
                 if not handle:
                     return None, ""
                 continue
             if "mailbox" in detail_lc or "local_part" in detail_lc:
-                local_part = prompt("Pick a different mailbox local part (or empty for auto)").strip()
+                local_part = prompt("  Pick a different mailbox local part (or empty for auto)").strip()
                 continue
             return None, ""
         except Exception as e:
@@ -2429,15 +2470,10 @@ def _inkbox_offer_phone_for_existing(client, identity):
     if not prompt_yes_no("  Provision a local phone number now?", True):
         return identity
 
-    state = prompt(
-        "  US state code for the local number (e.g. CA, NY) — leave empty for any"
-    ).strip().upper() or None
-
     try:
         provisioned = client.phone_numbers.provision(
             agent_handle=identity.agent_handle,
             type="local",
-            state=state,
         )
         print_success(f"  Provisioned: {provisioned.number}")
     except Exception as e:
