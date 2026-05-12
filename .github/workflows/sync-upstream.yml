@@ -55,7 +55,10 @@ jobs:
       - name: Phase 1 — fast-forward main to upstream/main
         id: sync_main
         run: |
-          git checkout "${MIRROR_BRANCH}"
+          # Force-create the local `main` from origin/main. Plain
+          # `git checkout main` is ambiguous because both origin/main
+          # and upstream/main exist as remote-tracking branches.
+          git checkout -B "${MIRROR_BRANCH}" "origin/${MIRROR_BRANCH}"
           if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
             echo "main_changed=false" >> "$GITHUB_OUTPUT"
             echo "main already matches upstream/${UPSTREAM_BRANCH}; nothing to push."
