@@ -145,6 +145,8 @@ jobs:
           CONFLICT_FILES: ${{ steps.merge.outputs.conflict_files }}
           NEW_COMMITS: ${{ steps.check.outputs.new_commits }}
         run: |
+          set -euo pipefail
+
           if [[ "$CONFLICTS" == "true" ]]; then
             title="⚠️  Sync ${TARGET_BRANCH} with ${MIRROR_BRANCH} (CONFLICTS)"
             body=$(printf '## Upstream sync — CONFLICTS\n\nMerging `%s` (mirror of `%s@%s`) into `%s` hit conflicts. Conflict markers are committed in the tree so the diff is reviewable.\n\n**To resolve:** pull this branch locally, fix the marked files, and force-push.\n\n```bash\ngit fetch origin %s\ngit checkout %s\n# resolve conflicts in the files below\ngit add -A && git commit --amend --no-edit\ngit push --force origin %s\n```\n\n### Conflicted files\n\n```\n%s\n```\n\n_Opened by `.github/workflows/sync-upstream.yml`._' \
@@ -155,13 +157,37 @@ jobs:
               "$MIRROR_BRANCH" "$UPSTREAM_REPO" "$UPSTREAM_BRANCH" "$TARGET_BRANCH" "$NEW_COMMITS")
           fi
 
-          # Update existing rolling PR if open, otherwise open a new one.
-          existing=$(gh pr list --base "$TARGET_BRANCH" --head "$SYNC_BRANCH" \
-                     --state open --json number --jq '.[0].number // ""')
+          # Speak REST not GraphQL: `gh pr create` goes through the
+          # GraphQL `createPullRequest` mutation which our App token
+          # gets "Resource not accessible by integration" on, despite
+          # holding pull-requests:write. The REST `POST /pulls` endpoint
+          # honors the same permission scope correctly.
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          accept='Accept: application/vnd.github+json'
+          auth="Authorization: Bearer ${GH_TOKEN}"
+
+          existing=$(curl -sS -H "$auth" -H "$accept" \
+            "${api}/pulls?state=open&base=${TARGET_BRANCH}&head=${OWNER}:${SYNC_BRANCH}" \
+            | jq -r '.[0].number // ""')
+
           if [[ -n "$existing" ]]; then
-            gh pr edit "$existing" --title "$title" --body "$body"
-            echo "Updated PR #$existing."
+            curl -sS -X PATCH -H "$auth" -H "$accept" \
+              "${api}/pulls/${existing}" \
+              -d "$(jq -n --arg t "$title" --arg b "$body" '{title:$t, body:$b}')" \
+              > /dev/null
+            echo "Updated PR #${existing}."
           else
-            gh pr create --base "$TARGET_BRANCH" --head "$SYNC_BRANCH" \
-                         --title "$title" --body "$body"
+            resp=$(curl -sS -X POST -H "$auth" -H "$accept" \
+              "${api}/pulls" \
+              -d "$(jq -n --arg t "$title" --arg b "$body" \
+                          --arg h "$SYNC_BRANCH" --arg base "$TARGET_BRANCH" \
+                          '{title:$t, body:$b, head:$h, base:$base}')")
+            number=$(echo "$resp" | jq -r '.number // empty')
+            if [[ -z "$number" ]]; then
+              echo "::error::PR create failed. Response body:"
+              echo "$resp"
+              exit 1
+            fi
+            echo "Opened PR #${number}."
           fi
