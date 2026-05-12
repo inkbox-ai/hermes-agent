@@ -124,6 +124,19 @@ SMS_MAX_LENGTH = 1600  # Inkbox SMS hard cap
 # them at adapter.send() so they never get delivered as real messages.
 _ADMIN_NOTICE_PREFIXES: Tuple[str, ...] = (
     "◐", "◆", "📬", "🔄", "✓", "✗", "⚠️", "⚠", "⚡", "💡", "⏳",
+    # Tool-call narration glyphs — Hermes emits these as interim
+    # "I'm running X right now" updates while streaming. They have no
+    # place in a real SMS or email thread.
+    "💻",  # terminal / bash
+    "🔎",  # grep / search_files
+    "📖",  # read
+    "📝",  # write / edit
+    "📚",  # skill load
+    "🐍",  # exec / python
+    "🌐",  # web fetch
+    "🧠",  # thinking / reasoning
+    "🛠",  # tool generic
+    "🔧",  # tool generic alt
 )
 
 # Substrings that mark CLI/TUI runtime chatter even when the leading glyph is
