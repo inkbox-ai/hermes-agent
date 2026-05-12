@@ -2,8 +2,8 @@ name: Sync inkbox with upstream main
 
 on:
   schedule:
-    # Mondays at 09:00 UTC — catch upstream's weekend activity.
-    - cron: '0 9 * * 1'
+    # Daily at 09:00 UTC — upstream ships fast, keep the gap small.
+    - cron: '0 9 * * *'
   workflow_dispatch:
 
 permissions:
