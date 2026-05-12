@@ -32,21 +32,25 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 
 `inkbox-ai/hermes-agent` is the **Inkbox-powered fork** of [Nous Research's Hermes Agent](https://github.com/NousResearch/hermes-agent). Same core agent runtime — the difference is how your agent is wired up to the outside world.
 
-Upstream Hermes lives in your terminal or talks to humans through chat apps like Telegram, Discord, and Slack. This fork goes one layer further: it gives your agent **its own email address, phone number, and voice line** via [Inkbox](https://inkbox.ai) — API-first communication infrastructure built for AI agents. After `hermes setup`, your agent has:
+Out of the box, upstream Hermes talks to humans through chat apps (Telegram, Discord, Slack). Giving your agent **its own email address or phone number** means stitching together a fleet of services: SES or SendGrid for email, Twilio for SMS, a SIP carrier for voice, a public server somewhere to receive their webhooks, and a separate API key + billing account for each one. Doable, but it's an afternoon of plumbing per channel and a full weekend if you want all of them.
+
+This fork collapses that into **one wizard, one platform, zero prerequisites.** [Inkbox](https://inkbox.ai) is API-first communication infrastructure for AI agents — email, SMS, voice, and persistent identity, all under one roof, with a tunnel runtime so you don't host webhook servers. **You don't even need an Inkbox account before you start** — `hermes setup` walks you through self-signup inline, creates the agent identity, mints the API key, and writes it to your env. From zero to "your agent has an email address and a phone number" in one command.
+
+After `hermes setup`, your agent has:
 
 - A real email address it can send and receive from (`yourname@inkboxmail.com`)
 - A real phone number that handles inbound SMS and voice calls
 - A persistent identity + contact list that survives across sessions
-- No webhook server to host — the SDK ships with a tunnel runtime that handles inbound routing for you
+- No SES/SendGrid/Twilio/SIP accounts to wrangle, no webhook server to host, no API keys to juggle
 
 What's actually different in this fork vs upstream:
 
 - The `inkbox` SDK and `aiohttp` are **core dependencies**, not optional extras — so a base install works without `[inkbox]` flags
-- `hermes setup` includes the Inkbox sign-up flow inline (creates the identity, mints the API key, writes the env)
+- `hermes setup` includes the Inkbox sign-up flow inline (no account prerequisite)
 - Tunnel runtime + gateway adapter built in
 - Gateway service installer wires the runtime to systemd / launchd / Scheduled Task
 
-If you want **just the Hermes agent** without Inkbox integration, run upstream at [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent). If you want your agent reachable by email, SMS, or phone call out of the box — that's what this fork is for.
+If you want **just the Hermes agent** without Inkbox integration, run upstream at [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent) and bring your own SMTP / Twilio / SIP stack. If you want all of that under one platform with no upfront account or key — that's what this fork is for.
 
 We sync with the base repo daily, so changes here are scoped to the Inkbox-integration layer.
 
