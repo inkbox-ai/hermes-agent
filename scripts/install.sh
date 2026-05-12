@@ -858,11 +858,15 @@ clone_repo() {
             cd "$INSTALL_DIR"
 
             local autostash_ref=""
-            if [ -n "$(git status --porcelain)" ]; then
-                local stash_name
+            local stash_name=""
+            # Only stash if there are TRACKED changes. Untracked files survive a
+            # fast-forward pull on their own and don't need to be moved aside —
+            # stashing them just to immediately reapply causes spurious "local
+            # changes detected" runs on every install of a clean checkout.
+            if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
                 stash_name="hermes-install-autostash-$(date -u +%Y%m%d-%H%M%S)"
                 log_info "Local changes detected, stashing before update..."
-                git stash push --include-untracked -m "$stash_name"
+                git stash push -m "$stash_name"
                 autostash_ref="$(git rev-parse --verify refs/stash)"
             fi
 
@@ -887,7 +891,15 @@ clone_repo() {
                 if [ "$restore_now" = "yes" ]; then
                     log_info "Restoring local changes..."
                     if git stash apply "$autostash_ref"; then
-                        git stash drop "$autostash_ref" >/dev/null
+                        # `git stash drop` strictly requires a stash@{N} reflog ref;
+                        # the raw SHA captured at push time is rejected. Look up the
+                        # current reflog selector by our unique stash message.
+                        local stash_reflog_ref
+                        stash_reflog_ref="$(git stash list --format='%gd%x09%gs' \
+                            | awk -F'\t' -v name="$stash_name" '$2 ~ name {print $1; exit}')"
+                        if [ -n "$stash_reflog_ref" ]; then
+                            git stash drop "$stash_reflog_ref" >/dev/null 2>&1 || true
+                        fi
                         log_warn "Local changes were restored on top of the updated codebase."
                         log_warn "Review git diff / git status if Hermes behaves unexpectedly."
                     else
