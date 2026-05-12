@@ -28,12 +28,44 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 
 ---
 
+## Why this fork exists
+
+`inkbox-ai/hermes-agent` is the **Inkbox-powered fork** of [Nous Research's Hermes Agent](https://github.com/NousResearch/hermes-agent). Same core agent runtime — the difference is how your agent is wired up to the outside world.
+
+Upstream Hermes lives in your terminal or talks to humans through chat apps like Telegram, Discord, and Slack. This fork goes one layer further: it gives your agent **its own email address, phone number, and voice line** via [Inkbox](https://inkbox.ai) — API-first communication infrastructure built for AI agents. After `hermes setup`, your agent has:
+
+- A real email address it can send and receive from (`yourname@inkboxmail.com`)
+- A real phone number that handles inbound SMS and voice calls
+- A persistent identity + contact list that survives across sessions
+- No webhook server to host — the SDK ships with a tunnel runtime that handles inbound routing for you
+
+What's actually different in this fork vs upstream:
+
+- The `inkbox` SDK and `aiohttp` are **core dependencies**, not optional extras — so a base install works without `[inkbox]` flags
+- `hermes setup` includes the Inkbox sign-up flow inline (creates the identity, mints the API key, writes the env)
+- Tunnel runtime + gateway adapter built in
+- Gateway service installer wires the runtime to systemd / launchd / Scheduled Task
+
+If you want **just the Hermes agent** without Inkbox integration, run upstream at [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent). If you want your agent reachable by email, SMS, or phone call out of the box — that's what this fork is for.
+
+We sync with the base repo daily, so changes here are scoped to the Inkbox-integration layer.
+
+---
+
 ## Quick Install
+
+Two commands. By the end your agent has a real email address, a real phone number, and is running as a background service that auto-starts on boot.
 
 ### Linux, macOS, WSL2, Termux
 
 ```bash
+# 1. Install — uv, Python, Node.js, ripgrep, ffmpeg, Hermes itself
 curl -fsSL https://raw.githubusercontent.com/inkbox-ai/hermes-agent/inkbox/scripts/install.sh | bash
+
+# 2. Configure — provider/model, terminal backend, Inkbox (email + SMS + voice),
+#    and install the gateway as a system service (you'll be prompted before
+#    anything is started or installed)
+hermes setup
 ```
 
 ### Windows (native, PowerShell) — Early Beta
