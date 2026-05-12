@@ -1,0 +1,112 @@
+name: Sync inkbox with upstream main
+
+on:
+  schedule:
+    # Mondays at 09:00 UTC — catch upstream's weekend activity.
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    # Don't run on other forks if they pull this workflow file in.
+    if: github.repository == 'inkbox-ai/hermes-agent'
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: NousResearch/hermes-agent
+      UPSTREAM_BRANCH: main
+      TARGET_BRANCH: inkbox
+      SYNC_BRANCH: sync/upstream-main
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          # Full history so the merge has a valid base.
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+      - name: Check whether upstream is ahead
+        id: check
+        run: |
+          # If every upstream commit is already in inkbox, nothing to do.
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "in_sync=true" >> "$GITHUB_OUTPUT"
+            echo "Already up to date with upstream/${UPSTREAM_BRANCH}."
+          else
+            new_commits=$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}")
+            echo "in_sync=false" >> "$GITHUB_OUTPUT"
+            echo "new_commits=${new_commits}" >> "$GITHUB_OUTPUT"
+            echo "Upstream is ahead by ${new_commits} commit(s)."
+          fi
+
+      - name: Merge upstream into sync branch
+        if: steps.check.outputs.in_sync == 'false'
+        id: merge
+        run: |
+          git checkout -B "${SYNC_BRANCH}"
+          # --no-ff keeps the merge commit so the audit trail is obvious.
+          if git merge --no-ff --no-edit \
+              -m "Merge upstream/${UPSTREAM_BRANCH} into ${TARGET_BRANCH}" \
+              "upstream/${UPSTREAM_BRANCH}"; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+          else
+            # Stage conflicted files (with markers in place) so reviewers see
+            # the conflict in the diff instead of a failed workflow.
+            conflict_files=$(git diff --name-only --diff-filter=U)
+            {
+              echo 'conflict_files<<EOF'
+              echo "$conflict_files"
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+            git add -A
+            git commit -m "Merge upstream/${UPSTREAM_BRANCH} into ${TARGET_BRANCH} (CONFLICTS)" \
+                       -m "Conflicted files (markers in tree, resolve manually):" \
+                       -m "$conflict_files"
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push sync branch
+        if: steps.check.outputs.in_sync == 'false'
+        run: git push origin "${SYNC_BRANCH}" --force
+
+      - name: Open or update sync PR
+        if: steps.check.outputs.in_sync == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          CONFLICT_FILES: ${{ steps.merge.outputs.conflict_files }}
+          NEW_COMMITS: ${{ steps.check.outputs.new_commits }}
+        run: |
+          if [[ "$CONFLICTS" == "true" ]]; then
+            title="⚠️  Sync inkbox with upstream/${UPSTREAM_BRANCH} (CONFLICTS)"
+            body=$(printf '## Upstream sync — CONFLICTS\n\nMerging `%s@%s` into `%s` hit conflicts. Conflict markers are committed in the tree so the diff is reviewable.\n\n**To resolve:** pull this branch locally, resolve the marked files, and force-push.\n\n```bash\ngit fetch origin %s\ngit checkout %s\n# resolve conflicts in the files below\ngit add -A && git commit --amend --no-edit\ngit push --force origin %s\n```\n\n### Conflicted files\n\n```\n%s\n```\n\n_Opened by `.github/workflows/sync-upstream.yml`._' \
+              "$UPSTREAM_REPO" "$UPSTREAM_BRANCH" "$TARGET_BRANCH" "$SYNC_BRANCH" "$SYNC_BRANCH" "$SYNC_BRANCH" "$CONFLICT_FILES")
+          else
+            title="Sync inkbox with upstream/${UPSTREAM_BRANCH}"
+            body=$(printf '## Upstream sync\n\nClean merge of `%s@%s` into `%s`. New upstream commits: **%s**.\n\nReview the upstream changes, then merge.\n\n_Opened by `.github/workflows/sync-upstream.yml`._' \
+              "$UPSTREAM_REPO" "$UPSTREAM_BRANCH" "$TARGET_BRANCH" "$NEW_COMMITS")
+          fi
+
+          # Update existing rolling PR if one is open, otherwise open a new one.
+          existing=$(gh pr list --base "$TARGET_BRANCH" --head "$SYNC_BRANCH" \
+                     --state open --json number --jq '.[0].number // ""')
+          if [[ -n "$existing" ]]; then
+            gh pr edit "$existing" --title "$title" --body "$body"
+            echo "Updated PR #$existing."
+          else
+            gh pr create --base "$TARGET_BRANCH" --head "$SYNC_BRANCH" \
+                         --title "$title" --body "$body"
+          fi
