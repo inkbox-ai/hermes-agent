@@ -3198,13 +3198,16 @@ def setup_gateway(config: dict):
 
     platforms = _all_platforms()
 
-    # Build checklist, pre-selecting already-configured platforms.
+    # Build checklist, pre-selecting already-configured platforms — plus
+    # Inkbox by default, since wiring up Inkbox is the whole reason this
+    # fork exists. A user can still untoggle it if they really don't want
+    # email + SMS + voice on their agent.
     items = []
     pre_selected = []
     for i, plat in enumerate(platforms):
         status = _platform_status(plat)
         items.append(f"{plat['emoji']} {plat['label']}  ({status})")
-        if status == "configured":
+        if status == "configured" or plat.get("key") == "inkbox":
             pre_selected.append(i)
 
     selected = prompt_checklist("Select platforms to configure:", items, pre_selected)
