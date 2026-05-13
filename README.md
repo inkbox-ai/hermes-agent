@@ -14,6 +14,8 @@ A fork of [Nous Research's Hermes Agent](https://github.com/NousResearch/hermes-
 
 ## Quick Install
 
+**Linux / macOS / WSL2 / Termux:**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/inkbox-ai/hermes-agent/inkbox/scripts/install.sh | bash
 ```
@@ -28,7 +30,7 @@ irm https://raw.githubusercontent.com/inkbox-ai/hermes-agent/inkbox/scripts/inst
 
 WSL2 is the more battle-tested path.
 
-By the end your agent has:
+**By the end your agent has:**
 
 - A real email address (`yourname@inkboxmail.com`) it can send and receive from
 - A real phone number that handles inbound SMS and voice
