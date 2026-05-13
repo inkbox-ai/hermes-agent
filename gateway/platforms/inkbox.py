@@ -1121,6 +1121,22 @@ class InkboxAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _handle_call_ws(self, request: "web.Request") -> "web.WebSocketResponse":
+        # Verify the HMAC on the upgrade BEFORE prepare(). The public tunnel
+        # URL is reachable by anyone on the internet — the tunnel's TLS
+        # only auths the SDK<->edge channel, not the requests flowing
+        # through it. Inkbox-server signs the WS upgrade with the same
+        # scheme as webhooks (sign_webhook_payload over the
+        # X-Call-Context body), so the same verify_webhook works here.
+        if self._require_signature:
+            call_context = request.headers.get("X-Call-Context", "") or ""
+            ok = verify_webhook(
+                payload=call_context.encode(),
+                headers=dict(request.headers),
+                secret=self._signing_key,
+            )
+            if not ok:
+                return web.Response(status=401, text="invalid signature")
+
         # ``WebSocketResponse`` doesn't take ``headers=`` as a constructor kwarg;
         # we mutate ``ws.headers`` before ``prepare()`` instead, which is what
         # aiohttp's ``StreamResponse`` accepts.  These two headers tell Inkbox
