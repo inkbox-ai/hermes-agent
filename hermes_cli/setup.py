@@ -2397,6 +2397,7 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
             self.number = p.number
             self.type = getattr(p, "type", "local")
             self.sms_status = getattr(p, "sms_status", None)
+            self.id = getattr(p, "id", None)
 
     class _SignupIdentityShim:
         agent_handle = resp.agent_handle
@@ -2750,6 +2751,7 @@ def _inkbox_offer_phone_for_existing(client, identity):
                 self.number = p.number
                 self.type = getattr(p, "type", "local")
                 self.sms_status = getattr(p, "sms_status", None)
+                self.id = getattr(p, "id", None)
         identity.phone_number = _PhoneShim(provisioned)
         return identity, True
 
