@@ -1958,6 +1958,16 @@ def _setup_inkbox():
     # ── Final summary ──
     _inkbox_print_agent_summary(identity)
 
+    # Hold for the user — gateway_setup() returns to its curses platform
+    # picker right after this, which fullscreen-clears the terminal and
+    # buries the handle / mailbox / phone / opt-in / reachability info.
+    if is_interactive_stdin():
+        print()
+        try:
+            input(color("  Press Enter to continue...", Colors.DIM))
+        except (KeyboardInterrupt, EOFError):
+            print()
+
 
 def _inkbox_invalidate_identity_state() -> None:
     """Delete ``inkbox_identity_state.json`` so the gateway repopulates it.
