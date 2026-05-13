@@ -1917,13 +1917,16 @@ def _setup_inkbox():
 
     api_key: str = ""
     identity = None  # AgentIdentity at the end of any branch
+    did_provision_phone = False  # gates the SMS-opt-in wait below
 
     if not has_key:
-        identity, api_key = _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError)
+        identity, api_key, did_provision_phone = _inkbox_self_signup_flow(
+            base_url, Inkbox, InkboxAPIError,
+        )
         if identity is None:
             return  # user aborted or signup failed
     else:
-        identity, api_key = _inkbox_api_key_flow(
+        identity, api_key, did_provision_phone = _inkbox_api_key_flow(
             base_url,
             Inkbox,
             InkboxAPIError,
@@ -1962,13 +1965,13 @@ def _setup_inkbox():
     # ── Final summary ──
     _inkbox_print_agent_summary(identity)
 
-    # ── Block until the user has texted START to their number ──
-    # No-ops when an inbound START already exists on this phone.
-    _inkbox_wait_for_sms_opt_in(
-        api_key,
-        base_url,
-        getattr(identity, "phone_number", None),
-    )
+    # ── Block until the user has texted START to their new number ──
+    if did_provision_phone:
+        _inkbox_wait_for_sms_opt_in(
+            api_key,
+            base_url,
+            getattr(identity, "phone_number", None),
+        )
 
     # ── Webhook signing key ──
     _inkbox_setup_signing_key(api_key, base_url)
@@ -2064,11 +2067,11 @@ def _inkbox_wait_for_sms_opt_in(api_key: str, base_url: str, phone) -> None:
     Local A2P numbers gate outbound SMS on each recipient having texted
     START at least once — without it, the agent's first outbound SMS
     weeks later fails with ``recipient_not_opted_in`` and the user has
-    no idea why.
+    no idea why. Caller is responsible for invoking this only when a
+    phone was actually provisioned in the current wizard pass.
 
-    Self-gating: lists existing texts once up front. If any past inbound
-    START is on this phone, skip — already opted in. Otherwise polls
-    ``client.texts.list`` every 3s for one. Ctrl+C skips gracefully.
+    Polls ``client.texts.list`` every 3s for an inbound 'START'.
+    Ctrl+C skips gracefully.
 
     Args:
         api_key: str — Inkbox API key for the SDK client.
@@ -2101,15 +2104,6 @@ def _inkbox_wait_for_sms_opt_in(api_key: str, base_url: str, phone) -> None:
     except Exception:
         # Can't construct SDK client — skip silently rather than block
         # the wizard on a transient init failure.
-        return
-
-    # One-shot check: if any past inbound START is already on this
-    # phone, the user has opted in before and we don't need to wait.
-    try:
-        existing = client.texts.list(phone_id, limit=50)
-    except Exception:
-        existing = []
-    if _find_start(existing) is not None:
         return
 
     print()
@@ -2211,10 +2205,11 @@ def _inkbox_seed_identity_state(identity) -> None:
 def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
     """Branch: user has no API key → public agent self-signup.
 
-    Returns (AgentIdentity-like-object, api_key) on success, or (None, "") on
-    abort/failure. The "identity" returned in this branch is a lightweight
-    proxy with .agent_handle and .email_address — full SDK AgentIdentity isn't
-    accessible until after email verification + initial bootstrap.
+    Returns ``(AgentIdentity-like-object, api_key, did_provision_phone)``
+    on success, or ``(None, "", False)`` on abort/failure. The "identity"
+    returned in this branch is a lightweight proxy with .agent_handle and
+    .email_address — full SDK AgentIdentity isn't accessible until after
+    email verification + initial bootstrap.
     """
     print()
     print_info("No problem — we'll create a fresh agent identity for you.")
@@ -2233,13 +2228,13 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
             human_email = prompt("  Your email address (for the verification step)").strip()
             if not human_email or "@" not in human_email:
                 print_error("  A valid email address is required for signup.")
-                return None, ""
+                return None, "", False
 
         if not handle:
             handle = prompt("  Desired agent handle (e.g. on-call-agent, recruiting-agent)").strip()
             if not handle:
                 print_error("  Agent handle is required.")
-                return None, ""
+                return None, "", False
 
         if local_part is None:
             local_part = prompt(
@@ -2273,7 +2268,7 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
                 if _inkbox_retry_or_abort("Try a different email", error_context=ctx):
                     human_email = ""
                     continue
-                return None, ""
+                return None, "", False
 
             if e.status_code in (409, 422) and ("email address" in detail_lc or "local" in detail_lc):
                 ctx = (
@@ -2284,7 +2279,7 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
                 if _inkbox_retry_or_abort("Pick a different local part", error_context=ctx):
                     local_part = None
                     continue
-                return None, ""
+                return None, "", False
 
             ctx = (
                 f"Signup failed: HTTP {e.status_code} — {detail}\n\n"
@@ -2297,10 +2292,10 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
                 human_email = handle = ""
                 local_part = None
                 continue
-            return None, ""
+            return None, "", False
         except Exception as e:
             print_error(f"  Signup failed: {e}")
-            return None, ""
+            return None, "", False
 
     print_success(f"Agent created — mailbox: {resp.email_address}")
     print_info(f"  Handle: {resp.agent_handle}")
@@ -2409,7 +2404,7 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
         mailbox = _MailboxShim()
         phone_number = _PhoneShim(provisioned_phone) if provisioned_phone else None
 
-    return _SignupIdentityShim(), resp.api_key
+    return _SignupIdentityShim(), resp.api_key, provisioned_phone is not None
 
 
 def _inkbox_retry_or_abort(retry_label: str, *, error_context: str = "") -> bool:
@@ -2461,13 +2456,14 @@ def _inkbox_api_key_flow(
 ):
     """Branch: user has an API key → whoami-driven flow.
 
-    Returns (AgentIdentity, api_key) on success, (None, "") on abort.
+    Returns ``(AgentIdentity, api_key, did_provision_phone)`` on success,
+    ``(None, "", False)`` on abort.
     """
     print()
     api_key = prompt("  Paste your Inkbox API key (ApiKey_…)", password=True).strip()
     if not api_key:
         print_error("  No key provided.")
-        return None, ""
+        return None, "", False
 
     try:
         client = Inkbox(api_key=api_key, base_url=base_url)
@@ -2475,14 +2471,14 @@ def _inkbox_api_key_flow(
     except InkboxAPIError as e:
         print_error(f"  whoami failed: HTTP {e.status_code} {e.detail}")
         print_info("  Double-check the key (and the environment it was issued in).")
-        return None, ""
+        return None, "", False
     except Exception as e:
         print_error(f"  whoami failed: {e}")
-        return None, ""
+        return None, "", False
 
     if not isinstance(info, WhoamiApiKeyResponse):
         print_error("  This wizard requires an API key, but the credential is a JWT.")
-        return None, ""
+        return None, "", False
 
     subtype = info.auth_subtype or ""
     print_success(f"  Key validated — org {info.organization_id}, scope: {subtype or 'unknown'}")
@@ -2502,16 +2498,20 @@ def _inkbox_api_key_flow(
 
 
 def _inkbox_pick_agent_scoped(client, api_key):
-    """Agent-scoped key path: list_identities() returns just this agent's row."""
+    """Agent-scoped key path: list_identities() returns just this agent's row.
+
+    Returns ``(identity, api_key, did_provision_phone)`` on success,
+    ``(None, "", False)`` on abort.
+    """
     try:
         ids = client.list_identities()
     except Exception as e:
         print_error(f"  list_identities failed: {e}")
-        return None, ""
+        return None, "", False
 
     if not ids:
         print_error("  Agent-scoped key but no identity returned. Server bug?")
-        return None, ""
+        return None, "", False
     if len(ids) > 1:
         print_warning(f"  Agent-scoped key returned {len(ids)} identities — using the first.")
 
@@ -2520,12 +2520,12 @@ def _inkbox_pick_agent_scoped(client, api_key):
         identity = client.get_identity(summary.agent_handle)
     except Exception as e:
         print_error(f"  get_identity failed: {e}")
-        return None, ""
+        return None, "", False
 
     print()
     print_info(f"  This API key is bound to identity: {identity.agent_handle}")
-    identity = _inkbox_offer_phone_for_existing(client, identity)
-    return identity, api_key
+    identity, did_provision_phone = _inkbox_offer_phone_for_existing(client, identity)
+    return identity, api_key, did_provision_phone
 
 
 def _inkbox_mint_agent_scoped_key(client, identity, admin_key, InkboxAPIError):
@@ -2561,12 +2561,16 @@ def _inkbox_mint_agent_scoped_key(client, identity, admin_key, InkboxAPIError):
 
 
 def _inkbox_pick_admin_scoped(client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError):
-    """Admin-scoped key path: pick existing identity or create a new one."""
+    """Admin-scoped key path: pick existing identity or create a new one.
+
+    Returns ``(identity, agent_key, did_provision_phone)`` on success,
+    ``(None, "", False)`` on abort.
+    """
     try:
         ids = client.list_identities()
     except Exception as e:
         print_error(f"  list_identities failed: {e}")
-        return None, ""
+        return None, "", False
 
     print()
     if ids:
@@ -2600,35 +2604,39 @@ def _inkbox_pick_admin_scoped(client, api_key, IdentityPhoneNumberCreateOptions,
                     identity = client.get_identity(ids[idx].agent_handle)
                 except Exception as e:
                     print_error(f"  get_identity failed: {e}")
-                    return None, ""
-            identity = _inkbox_offer_phone_for_existing(client, identity)
+                    return None, "", False
+            identity, did_provision_phone = _inkbox_offer_phone_for_existing(client, identity)
             # Down-scope: replace the admin key with a fresh agent-scoped one
             # before persisting. The admin key never lands in .env.
             agent_key = _inkbox_mint_agent_scoped_key(
                 client, identity, api_key, InkboxAPIError,
             )
             if agent_key is None:
-                return None, ""
-            return identity, agent_key
+                return None, "", False
+            return identity, agent_key, did_provision_phone
         # Fall through to create-new
     else:
         print_info("  No identities exist yet under this org. Let's create the first one.")
 
-    identity, _ = _inkbox_create_identity(
+    identity, _, did_provision_phone = _inkbox_create_identity(
         client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError,
     )
     if identity is None:
-        return None, ""
+        return None, "", False
     agent_key = _inkbox_mint_agent_scoped_key(
         client, identity, api_key, InkboxAPIError,
     )
     if agent_key is None:
-        return None, ""
-    return identity, agent_key
+        return None, "", False
+    return identity, agent_key, did_provision_phone
 
 
 def _inkbox_create_identity(client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError):
-    """Collect handle / mailbox / optional-phone and call create_identity()."""
+    """Collect handle / mailbox / optional-phone and call create_identity().
+
+    Returns ``(identity, api_key, did_provision_phone)`` on success,
+    ``(None, "", False)`` on abort.
+    """
     print()
     print_header("Create new agent identity")
 
@@ -2679,36 +2687,45 @@ def _inkbox_create_identity(client, api_key, IdentityPhoneNumberCreateOptions, I
             if "handle" in detail_lc and "taken" in detail_lc:
                 handle = prompt("  Pick a different handle").strip()
                 if not handle:
-                    return None, ""
+                    return None, "", False
                 continue
             if "mailbox" in detail_lc or "local_part" in detail_lc:
                 local_part = prompt("  Pick a different mailbox local part (or empty for auto)").strip()
                 continue
-            return None, ""
+            return None, "", False
         except Exception as e:
             print_error(f"  Creation failed: {e}")
-            return None, ""
+            return None, "", False
 
     print_success(f"  Created identity '{identity.agent_handle}'")
-    return identity, api_key
+    # Phone is freshly provisioned iff the user opted in AND create_identity
+    # actually returned one attached.
+    did_provision_phone = create_phone and getattr(identity, "phone_number", None) is not None
+    return identity, api_key, did_provision_phone
 
 
 def _inkbox_offer_phone_for_existing(client, identity):
     """If ``identity`` has no phone, offer to provision a local one inline.
 
     Used in the agent-scoped and admin-pick-existing branches — the
-    create-new branch already collects phone preferences inline. Returns the
-    same identity (with phone_number patched on success), or the original
-    untouched identity on skip / failure.
+    create-new branch already collects phone preferences inline.
+
+    Returns:
+        ``(identity, did_provision_phone)``. ``identity`` is the same
+        passed-in identity with ``phone_number`` patched on success, or
+        the original untouched identity on skip / failure.
+        ``did_provision_phone`` is ``True`` only when this call actually
+        provisioned a new phone — callers thread this up to gate the
+        SMS-opt-in wait step.
     """
     if getattr(identity, "phone_number", None) is not None:
-        return identity
+        return identity, False
 
     print()
     print_info("  This agent has no phone number attached.")
     print_info("  📞 A local US number unlocks SMS + voice for this agent.")
     if not prompt_yes_no("  Provision a local phone number now?", True):
-        return identity
+        return identity, False
 
     try:
         provisioned = client.phone_numbers.provision(
@@ -2719,14 +2736,14 @@ def _inkbox_offer_phone_for_existing(client, identity):
     except Exception as e:
         print_warning(f"  Phone provisioning failed: {e}")
         print_info("  You can provision a number later in the Inkbox console.")
-        return identity
+        return identity, False
 
     # Re-fetch so the summary printer sees the new phone via the same
     # _AgentIdentityData shape it expects (with full IdentityPhoneNumber
     # fields like sms_status). Falls back to a quick shim if get_identity
     # fails — shouldn't, but the summary should still print something.
     try:
-        return client.get_identity(identity.agent_handle)
+        return client.get_identity(identity.agent_handle), True
     except Exception:
         class _PhoneShim:
             def __init__(self, p):
@@ -2734,7 +2751,7 @@ def _inkbox_offer_phone_for_existing(client, identity):
                 self.type = getattr(p, "type", "local")
                 self.sms_status = getattr(p, "sms_status", None)
         identity.phone_number = _PhoneShim(provisioned)
-        return identity
+        return identity, True
 
 
 def _inkbox_print_agent_summary(identity):
