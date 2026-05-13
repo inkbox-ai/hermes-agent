@@ -181,6 +181,10 @@ from agent.tool_guardrails import (
     append_toolguard_guidance,
     toolguard_synthetic_result,
 )
+from agent.tool_result_classification import (
+    FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
+    file_mutation_result_landed,
+)
 from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
@@ -349,7 +353,7 @@ _PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
 
 # Tools that mutate files on disk.  Used by the per-turn verifier that
 # surfaces silently-failed file edits so the model can't over-claim success.
-_FILE_MUTATING_TOOLS = frozenset({"write_file", "patch"})
+# Imported above as `_FILE_MUTATING_TOOLS` from `agent.tool_result_classification`.
 
 # Maximum number of concurrent worker threads for parallel tool execution.
 _MAX_TOOL_WORKERS = 8
@@ -1454,15 +1458,6 @@ class AIAgent:
         # 1h tier costs 2x on write vs 1.25x for 5m, but amortizes across long
         # sessions with >5-minute pauses between turns (#14971).
         self._cache_ttl = "5m"
-        # Long-lived prefix caching: when enabled and supported by the
-        # current provider, splits the system prompt into a stable prefix
-        # (cached cross-session at 1h TTL) and a volatile suffix
-        # (memory/timestamp — never cached), and attaches a 1h cache_control
-        # marker to the last tool in the schema array.  Restricted to
-        # Claude on Anthropic / OpenRouter / Nous Portal; see
-        # ``_supports_long_lived_anthropic_cache``.
-        self._use_long_lived_prefix_cache = False
-        self._long_lived_cache_ttl = "1h"
         try:
             from hermes_cli.config import load_config as _load_pc_cfg
 
@@ -1470,12 +1465,6 @@ class AIAgent:
             _ttl = _pc_cfg.get("cache_ttl", "5m")
             if _ttl in {"5m", "1h"}:
                 self._cache_ttl = _ttl
-            _ll_enabled = _pc_cfg.get("long_lived_prefix", True)
-            _ll_ttl = _pc_cfg.get("long_lived_ttl", "1h")
-            if _ll_ttl in ("5m", "1h"):
-                self._long_lived_cache_ttl = _ll_ttl
-            if _ll_enabled and self._use_prompt_caching and self._supports_long_lived_anthropic_cache():
-                self._use_long_lived_prefix_cache = True
         except Exception:
             pass
 
@@ -2480,7 +2469,6 @@ class AIAgent:
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
             "use_native_cache_layout": self._use_native_cache_layout,
-            "use_long_lived_prefix_cache": self._use_long_lived_prefix_cache,
             # Context engine state that _try_activate_fallback() overwrites.
             # Use getattr for model/base_url/api_key/provider since plugin
             # engines may not have these (they're ContextCompressor-specific).
@@ -2647,6 +2635,11 @@ class AIAgent:
         old_model = self.model
         old_provider = self.provider
 
+        # Clear the per-config context_length override so the new model's
+        # actual context window is resolved via get_model_context_length()
+        # instead of inheriting the stale value from the previous model.
+        self._config_context_length = None
+
         # ── Swap core runtime fields ──
         self.model = new_model
         self.provider = new_provider
@@ -2711,15 +2704,6 @@ class AIAgent:
                 model=new_model,
             )
         )
-        self._use_long_lived_prefix_cache = bool(
-            self._use_prompt_caching
-            and self._supports_long_lived_anthropic_cache(
-                provider=new_provider,
-                base_url=self.base_url,
-                api_mode=api_mode,
-                model=new_model,
-            )
-        )
 
         # ── LM Studio: preload before probing context length ──
         self._ensure_lmstudio_runtime_loaded()
@@ -2768,7 +2752,6 @@ class AIAgent:
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
             "use_native_cache_layout": self._use_native_cache_layout,
-            "use_long_lived_prefix_cache": self._use_long_lived_prefix_cache,
             "compressor_model": getattr(_cc, "model", self.model) if _cc else self.model,
             "compressor_base_url": getattr(_cc, "base_url", self.base_url) if _cc else self.base_url,
             "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
@@ -3578,73 +3561,6 @@ class AIAgent:
             return True, False
 
         return False, False
-
-    def _supports_long_lived_anthropic_cache(
-        self,
-        *,
-        provider: Optional[str] = None,
-        base_url: Optional[str] = None,
-        api_mode: Optional[str] = None,
-        model: Optional[str] = None,
-    ) -> bool:
-        """Decide whether the long-lived (1h cross-session) cache layout applies.
-
-        Narrower than ``_anthropic_prompt_cache_policy`` — only enabled
-        for Claude models on the four endpoints whose cross-session
-        cache_control behavior we have explicitly validated:
-
-          * Native Anthropic API (``api_mode == 'anthropic_messages'`` +
-            host ``api.anthropic.com``)
-          * Anthropic OAuth subscription (same transport as native API)
-          * OpenRouter (``base_url`` contains ``openrouter.ai``)
-          * Nous Portal (``base_url`` contains ``nousresearch`` — proxies
-            to OpenRouter, so identical wire-format)
-
-        All four honour ``cache_control`` on both the tools array and the
-        first system content block, and bill cross-session cache reads at
-        the documented 0.1× rate.
-
-        Other endpoints covered by the standard ``system_and_3`` policy
-        (third-party Anthropic gateways, MiniMax, opencode-go Qwen, etc.)
-        keep that layout — they support cache_control but their behavior
-        with mixed-TTL multi-block system content has not been validated
-        against this codebase.
-        """
-        eff_provider = (provider if provider is not None else self.provider) or ""
-        eff_base_url = base_url if base_url is not None else (self.base_url or "")
-        eff_api_mode = api_mode if api_mode is not None else (self.api_mode or "")
-        eff_model = (model if model is not None else self.model) or ""
-
-        model_lower = eff_model.lower()
-        is_claude = "claude" in model_lower
-        is_nous_portal = "nousresearch" in eff_base_url.lower()
-
-        # Nous Portal: Claude AND Qwen both get long-lived caching.
-        # Portal proxies to OpenRouter with identical cache_control
-        # semantics; any model on Portal that accepts envelope-layout
-        # markers via _anthropic_prompt_cache_policy also benefits from
-        # the documented 1h cross-session TTL.
-        if is_nous_portal and (is_claude or "qwen" in model_lower):
-            return True
-
-        if not is_claude:
-            return False
-
-        # Native Anthropic + Anthropic OAuth subscription
-        if eff_api_mode == "anthropic_messages":
-            if eff_provider == "anthropic" or base_url_hostname(eff_base_url) == "api.anthropic.com":
-                return True
-
-        # OpenRouter
-        if base_url_host_matches(eff_base_url, "openrouter.ai"):
-            return True
-
-        # Nous Portal — front-ends OpenRouter behind the scenes; identical
-        # wire format and cache_control semantics.
-        if is_nous_portal:
-            return True
-
-        return False
 
     @staticmethod
     def _model_requires_responses_api(model: str) -> bool:
@@ -5435,7 +5351,8 @@ class AIAgent:
         targets = _extract_file_mutation_targets(tool_name, args)
         if not targets:
             return
-        if is_error:
+        landed = file_mutation_result_landed(tool_name, result)
+        if is_error and not landed:
             preview = _extract_error_preview(result)
             for path in targets:
                 # Keep the FIRST error we saw for a given path unless we
@@ -5894,26 +5811,19 @@ class AIAgent:
         """Assemble the system prompt as three ordered parts.
 
         Returns a dict with three keys:
-          * ``stable``  — content that is byte-stable across sessions for a
-            given user config: identity, tool guidance, skills prompt,
+          * ``stable``   — identity, tool guidance, skills prompt,
             environment hints, platform hints, model-family operational
-            guidance.  Eligible for cross-session 1h prompt caching when
-            placed as a separate Anthropic content block (see
-            ``apply_anthropic_cache_control_long_lived``).
-          * ``context`` — context files (AGENTS.md, .cursorrules, etc.) and
-            caller-supplied system_message.  Stable within a session but may
-            change between sessions when files are edited or the cwd
-            differs.  Cached within-session via the rolling messages
-            breakpoint (5m TTL); not promoted to the long-lived tier so
-            edits don't poison the cross-session cache.
-          * ``volatile`` — content that changes on most turns/sessions:
-            memory snapshot, user profile, external memory provider block,
-            timestamp line.  Never marked for caching.
+            guidance.
+          * ``context``  — context files (AGENTS.md, .cursorrules, etc.)
+            and caller-supplied system_message.
+          * ``volatile`` — memory snapshot, user profile, external
+            memory provider block, timestamp line.
 
-        Joined ``stable\\n\\ncontext\\n\\nvolatile`` produces the same
-        logical content the old single-string builder produced, with the
-        guarantee that volatile content is at the end (cache-friendly
-        ordering for any provider that does prefix caching).
+        Joined into a single string by ``_build_system_prompt`` and
+        cached on ``_cached_system_prompt`` for the lifetime of the
+        AIAgent.  Hermes never re-renders parts of this string mid-
+        session — that's the only way to keep upstream prompt caches
+        warm across turns.
         """
         # ── Stable tier ────────────────────────────────────────────────
         stable_parts: List[str] = []
@@ -6123,9 +6033,10 @@ class AIAgent:
 
         Layers are ordered cache-friendly: stable identity/guidance first,
         then session-stable context files, then per-call volatile content
-        (memory, USER profile, timestamp). The split is exposed via
-        ``_build_system_prompt_parts`` for the long-lived prompt-caching
-        path (Claude on Anthropic / OpenRouter / Nous Portal).
+        (memory, USER profile, timestamp).  The whole string is treated as
+        one cached block — Hermes never rebuilds or reinjects parts of it
+        mid-session, which is the only way to keep upstream prompt caches
+        warm across turns.
         """
         parts = self._build_system_prompt_parts(system_message=system_message)
         joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
@@ -8825,6 +8736,11 @@ class AIAgent:
                 fb_api_mode = "bedrock_converse"
 
             old_model = self.model
+
+            # Clear the per-config context_length override so the fallback
+            # model's actual context window is resolved instead of inheriting
+            # the stale value from the previous model.  See #22387.
+            self._config_context_length = None
             self.model = fb_model
             self.provider = fb_provider
             self.base_url = fb_base_url
@@ -8881,15 +8797,6 @@ class AIAgent:
             # Re-evaluate prompt caching for the new provider/model
             self._use_prompt_caching, self._use_native_cache_layout = (
                 self._anthropic_prompt_cache_policy(
-                    provider=fb_provider,
-                    base_url=fb_base_url,
-                    api_mode=fb_api_mode,
-                    model=fb_model,
-                )
-            )
-            self._use_long_lived_prefix_cache = bool(
-                self._use_prompt_caching
-                and self._supports_long_lived_anthropic_cache(
                     provider=fb_provider,
                     base_url=fb_base_url,
                     api_mode=fb_api_mode,
@@ -8971,16 +8878,6 @@ class AIAgent:
             self._use_native_cache_layout = rt.get(
                 "use_native_cache_layout",
                 self.api_mode == "anthropic_messages" and self.provider == "anthropic",
-            )
-            # Long-lived prefix flag was added later — restore False on
-            # snapshots predating the new field, then re-evaluate against
-            # the restored provider/model in case the user had it enabled.
-            self._use_long_lived_prefix_cache = rt.get(
-                "use_long_lived_prefix_cache",
-                bool(
-                    self._use_prompt_caching
-                    and self._supports_long_lived_anthropic_cache()
-                ),
             )
 
             # ── Rebuild client for the primary provider ──
@@ -9559,19 +9456,7 @@ class AIAgent:
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
-        # Resolve the tools array exactly once. When the long-lived
-        # prefix-cache layout is active (Claude on Anthropic / OpenRouter
-        # / Nous Portal), attach a 1h cache_control marker to the last
-        # tool — this caches the entire tools array cross-session via
-        # Anthropic's tools→system→messages prefix order. The function
-        # returns a deep copy, so self.tools is never mutated.
-        if self._use_long_lived_prefix_cache and self.tools:
-            from agent.prompt_caching import mark_tools_for_long_lived_cache
-            tools_for_api = mark_tools_for_long_lived_cache(
-                self.tools, long_lived_ttl=self._long_lived_cache_ttl,
-            )
-        else:
-            tools_for_api = self.tools
+        tools_for_api = self.tools
 
         if self.api_mode == "anthropic_messages":
             _transport = self._get_transport()
@@ -11670,7 +11555,8 @@ class AIAgent:
                         "effort": "medium"
                     }
             if _is_nous:
-                summary_extra_body["tags"] = ["product=hermes-agent"]
+                from agent.portal_tags import nous_portal_tags as _portal_tags
+                summary_extra_body["tags"] = _portal_tags()
 
             if self.api_mode == "codex_responses":
                 codex_kwargs = self._build_api_kwargs(api_messages)
@@ -12431,36 +12317,21 @@ class AIAgent:
             # External recall context is injected into the user message, not the system
             # prompt, so the stable cache prefix remains unchanged.
             #
-            # When the long-lived prefix-cache layout is active (Claude on
-            # Anthropic / OpenRouter / Nous Portal), we build the system
-            # message as a *list of content blocks*: [stable, context,
-            # volatile, ephemeral?].  Block 0 (stable) gets the 1h
-            # cache_control marker further down via
-            # apply_anthropic_cache_control_long_lived; blocks 1-3 are
-            # cached only via the rolling messages window at 5m.
             # NOTE: Plugin context from pre_llm_call hooks is injected into the
             # user message (see injection block above), NOT the system prompt.
             # This is intentional — system prompt modifications break the prompt
             # cache prefix.  The system prompt is reserved for Hermes internals.
-            if self._use_long_lived_prefix_cache:
-                _sys_parts = self._build_system_prompt_parts(system_message=system_message)
-                _sys_blocks: list = []
-                if _sys_parts.get("stable"):
-                    _sys_blocks.append({"type": "text", "text": _sys_parts["stable"]})
-                if _sys_parts.get("context"):
-                    _sys_blocks.append({"type": "text", "text": _sys_parts["context"]})
-                if _sys_parts.get("volatile"):
-                    _sys_blocks.append({"type": "text", "text": _sys_parts["volatile"]})
-                if self.ephemeral_system_prompt:
-                    _sys_blocks.append({"type": "text", "text": self.ephemeral_system_prompt})
-                if _sys_blocks:
-                    api_messages = [{"role": "system", "content": _sys_blocks}] + api_messages
-            else:
-                effective_system = active_system_prompt or ""
-                if self.ephemeral_system_prompt:
-                    effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
-                if effective_system:
-                    api_messages = [{"role": "system", "content": effective_system}] + api_messages
+            #
+            # Hermes invariant: the system prompt is built ONCE per session
+            # (cached on ``_cached_system_prompt``) and replayed verbatim on
+            # every turn.  We send it as a single content string so the
+            # bytes are byte-stable across turns and upstream prompt caches
+            # stay warm.
+            effective_system = active_system_prompt or ""
+            if self.ephemeral_system_prompt:
+                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+            if effective_system:
+                api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
             # Inject ephemeral prefill messages right after the system prompt
             # but before conversation history. Same API-call-time-only pattern.
@@ -12474,29 +12345,13 @@ class AIAgent:
             # gateways. Auto-detected: if ``_use_prompt_caching`` is set,
             # inject cache_control breakpoints (system + last 3 messages)
             # to reduce input token costs by ~75% on multi-turn
-            # conversations. Layout is chosen per endpoint by
-            # ``_anthropic_prompt_cache_policy``.
-            #
-            # Long-lived prefix layout (prefix_and_2): stable system block
-            # gets 1h marker + last 2 messages get 5m markers. Tools
-            # array's last entry is marked separately at API-call kwargs
-            # build time (see ``_build_api_kwargs`` and
-            # ``mark_tools_for_long_lived_cache``).
+            # conversations.
             if self._use_prompt_caching:
-                if self._use_long_lived_prefix_cache:
-                    from agent.prompt_caching import apply_anthropic_cache_control_long_lived
-                    api_messages = apply_anthropic_cache_control_long_lived(
-                        api_messages,
-                        long_lived_ttl=self._long_lived_cache_ttl,
-                        rolling_ttl=self._cache_ttl,
-                        native_anthropic=self._use_native_cache_layout,
-                    )
-                else:
-                    api_messages = apply_anthropic_cache_control(
-                        api_messages,
-                        cache_ttl=self._cache_ttl,
-                        native_anthropic=self._use_native_cache_layout,
-                    )
+                api_messages = apply_anthropic_cache_control(
+                    api_messages,
+                    cache_ttl=self._cache_ttl,
+                    native_anthropic=self._use_native_cache_layout,
+                )
 
             # Safety net: strip orphaned tool results / add stubs for missing
             # results before sending to the API.  Runs unconditionally — not
@@ -14450,7 +14305,7 @@ class AIAgent:
                             _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
                             if _ra_raw:
                                 try:
-                                    _retry_after = min(int(_ra_raw), 120)  # Cap at 2 minutes
+                                    _retry_after = min(float(_ra_raw), 120)  # Cap at 2 minutes
                                 except (TypeError, ValueError):
                                     pass
                     wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
