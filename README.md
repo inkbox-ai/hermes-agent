@@ -28,8 +28,6 @@ One command. Installs deps, then walks you through Inkbox self-signup (no accoun
 irm https://raw.githubusercontent.com/inkbox-ai/hermes-agent/inkbox/scripts/install.ps1 | iex
 ```
 
-WSL2 is the more battle-tested path.
-
 **By the end your agent has:**
 
 - A real email address (`yourname@inkboxmail.com`) it can send and receive from
