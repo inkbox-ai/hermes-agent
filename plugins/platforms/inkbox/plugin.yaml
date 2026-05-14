@@ -1,0 +1,71 @@
+name: inkbox-platform
+label: Inkbox
+kind: platform
+version: 1.0.0
+description: >
+  Inkbox gateway adapter for Hermes Agent.
+
+  Inkbox (https://inkbox.ai) is API-first communication infrastructure that
+  gives an AI agent a stable email address, phone number, and persistent
+  contact list scoped to a single agent identity. This adapter routes the
+  three Inkbox modalities — inbound email, inbound SMS, and live voice
+  calls — into a single contact-keyed Hermes session per remote party.
+author: Inkbox
+# ``requires_env`` and ``optional_env`` entries are surfaced in
+# ``hermes config`` UI via the platform-plugin env var injector in
+# ``hermes_cli/config.py``.
+requires_env:
+  - name: INKBOX_API_KEY
+    description: "Inkbox API key (admin or agent-scoped)"
+    prompt: "Inkbox API key"
+    url: "https://inkbox.ai/console/api-keys"
+    password: true
+  - name: INKBOX_IDENTITY
+    description: "Inkbox agent identity handle (the name your agent uses)"
+    prompt: "Inkbox identity handle"
+    password: false
+optional_env:
+  - name: INKBOX_SIGNING_KEY
+    description: "HMAC signing key for verifying inbound webhooks (strongly recommended)"
+    prompt: "Inkbox signing key"
+    password: true
+  - name: INKBOX_BASE_URL
+    description: "Inkbox API base URL (default: https://inkbox.ai)"
+    prompt: "Inkbox base URL (or empty for default)"
+    password: false
+  - name: INKBOX_HOST
+    description: "Local bind address for the webhook server (default: 0.0.0.0)"
+    prompt: "Local bind host (or empty for 0.0.0.0)"
+    password: false
+  - name: INKBOX_LISTEN_PORT
+    description: "Local port for the webhook server (default: 8765)"
+    prompt: "Local port (or empty for 8765)"
+    password: false
+  - name: INKBOX_PUBLIC_URL
+    description: "Public URL Inkbox should POST webhooks to (set to bypass the SDK tunnel)"
+    prompt: "Public webhook URL (or empty to use auto-tunnel)"
+    password: false
+  - name: INKBOX_TUNNEL_NAME
+    description: "Stable tunnel name for reuse across restarts (auto-generated if blank)"
+    prompt: "Tunnel name (or empty)"
+    password: false
+  - name: INKBOX_REQUIRE_SIGNATURE
+    description: "Fail closed if signing key is missing (default: true)"
+    prompt: "Require webhook signatures? (true/false)"
+    password: false
+  - name: INKBOX_HOME_CHANNEL
+    description: "Default contact_id / chat_id for cron + broadcast delivery"
+    prompt: "Home channel contact id (or empty)"
+    password: false
+  - name: INKBOX_HOME_CHANNEL_NAME
+    description: "Display name for the home channel"
+    prompt: "Home channel name (or empty)"
+    password: false
+  - name: INKBOX_ALLOWED_USERS
+    description: "Comma-separated emails / phone numbers / contact ids allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: INKBOX_ALLOW_ALL_USERS
+    description: "Allow anyone who reaches the agent's email/phone to start a session (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
