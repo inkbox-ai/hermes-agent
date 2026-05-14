@@ -9,12 +9,14 @@ calls — into a single contact-keyed Hermes session per remote party.
 Architecture
 ------------
 On ``connect()`` the adapter:
-  1. Provisions (or reuses) an Inkbox edge-mode tunnel via
-     ``POST /api/v1/tunnels`` and brings the data plane up.  The public
-     URL is ``https://{tunnel_name}.{env}.inkboxwire.com`` and the tunnel
-     id + connect secret are persisted in HERMES_HOME so subsequent runs
-     reuse the same tunnel.  Production deployments can bypass this by
-     setting ``INKBOX_PUBLIC_URL`` directly.
+  1. Brings up the Inkbox edge-mode tunnel attached to the configured
+     identity (tunnels are provisioned atomically when the identity is
+     created — there is no standalone ``POST /api/v1/tunnels``). The
+     public URL is ``https://{agent_handle}.{env}.inkboxwire.com`` and
+     the tunnel id is persisted in HERMES_HOME so subsequent runs reuse
+     the same tunnel. Data-plane auth uses the SDK client's ``x-api-key``
+     directly. Production deployments can bypass tunneling entirely by
+     setting ``INKBOX_PUBLIC_URL``.
   2. PATCHes every mailbox + phone number on the configured identity
      so their webhook URLs / call WebSocket URL point at the tunnel.
   3. Starts an aiohttp server with two routes:
@@ -196,9 +198,10 @@ def _inkbox_tunnel_state_dir() -> "Path":
 def _wipe_inkbox_tunnel_state(state_dir: "Path") -> None:
     """Remove the three SDK-owned files inside ``state_dir``.
 
-    Called on every connect so a stale tunnel id / connect secret from a
-    prior run can never block the next start. The directory itself is left
-    in place; the SDK recreates contents during ``connect()``.
+    Called on every connect so a stale ``tunnel_id`` referencing a tunnel
+    that's been removed server-side can never block the next start. The
+    directory itself is left in place; the SDK recreates contents during
+    ``connect()``.
     """
     for name in ("state.json", "private_key.pem", "cert_chain.pem"):
         path = state_dir / name
@@ -211,32 +214,6 @@ def _wipe_inkbox_tunnel_state(state_dir: "Path") -> None:
                 "[Inkbox] Couldn't remove stale tunnel state file %s: %s",
                 path, exc,
             )
-
-
-def _rotate_secret_by_name(inkbox_client, tunnel_name: str) -> Optional[str]:
-    """Look up an existing tunnel by name and rotate its connect_secret.
-
-    Returns the fresh secret on success, or ``None`` if no tunnel with
-    that name exists in the org. Used to recover from
-    ``TunnelSecretUnavailable`` after we wipe local state but the
-    server-side tunnel survives.
-    """
-    try:
-        tunnels = inkbox_client.tunnels.list()
-    except Exception as exc:
-        logger.warning("[Inkbox] tunnels.list() failed during rotate: %s", exc)
-        return None
-    match = next((t for t in tunnels if t.tunnel_name == tunnel_name), None)
-    if match is None:
-        return None
-    try:
-        rotated = inkbox_client.tunnels.rotate_secret(match.id)
-        return rotated.connect_secret
-    except Exception as exc:
-        logger.warning(
-            "[Inkbox] tunnels.rotate_secret(%s) failed: %s", match.id, exc,
-        )
-        return None
 
 
 def _slugify_for_tunnel(handle: str) -> str:
@@ -504,19 +481,18 @@ class InkboxAdapter(BasePlatformAdapter):
         background thread to drive it — which gives us a live data plane
         plus a place to log any runtime error the listener captures.
 
+        Data-plane auth uses the SDK client's ``x-api-key`` (admin-scoped
+        or scoped to this tunnel's owning identity), so there is no
+        connect_secret to mint, rotate, or persist on this side.
+
         SDK-managed state (state.json, private_key.pem, cert_chain.pem)
         lives in a dedicated subdir of HERMES_HOME so its generic filenames
         don't collide with Hermes' own state files. We wipe that subdir on
-        every connect so a previous run's tunnel id / connect_secret can
-        never put us in a "saved tunnel was removed server-side" loop. If
-        a same-named tunnel still exists server-side from a prior run, we
-        rotate its connect_secret (via the API key, which the wipe doesn't
-        touch) and pass the fresh one to ``connect`` — preserving the
-        public URL across restarts so patched mailbox / phone webhooks
-        don't go stale.
+        every connect so a stale ``tunnel_id`` referencing a tunnel that's
+        been removed server-side can never put us in a TunnelRemoved loop.
         """
         import threading
-        from inkbox.tunnels.exceptions import TunnelSecretUnavailable
+        from inkbox.tunnels.exceptions import TunnelNotProvisioned
 
         tunnel_name = self._tunnel_name_override or _slugify_for_tunnel(
             self._identity_handle,
@@ -526,50 +502,31 @@ class InkboxAdapter(BasePlatformAdapter):
 
         _wipe_inkbox_tunnel_state(state_dir)
 
-        connect_kwargs = dict(
-            name=tunnel_name,
-            forward_to=forward_to,
-            state_dir=state_dir,
-        )
-
         try:
             # ``connect`` is sync (does an HTTPS round-trip + opens the data
             # plane); offload to a thread so the gateway event loop isn't
             # blocked. The returned listener owns its own supervisor threads.
             self._tunnel = await asyncio.to_thread(
-                inkbox_tunnel_connect, self._inkbox, **connect_kwargs,
+                inkbox_tunnel_connect,
+                self._inkbox,
+                name=tunnel_name,
+                forward_to=forward_to,
+                state_dir=state_dir,
             )
-        except TunnelSecretUnavailable:
-            # The wipe removed the local connect_secret but a tunnel with
-            # this name still exists server-side. Rotate its secret with
-            # the API key and retry connect — the public URL stays stable.
-            logger.info(
-                "[Inkbox] Local secret missing for existing tunnel %r; "
-                "rotating via API and retrying.",
+        except TunnelNotProvisioned:
+            # The identity exists but its tunnel does not (1:1 invariant
+            # broken upstream, or running against an identity created
+            # before the data-model migration landed). Surface a clear
+            # message — recovery is to recreate the identity, which
+            # atomically provisions the tunnel again.
+            logger.error(
+                "[Inkbox] No tunnel provisioned for handle %r — recreate "
+                "the identity via the Inkbox console or `inkbox identity "
+                "create`, then restart the gateway.",
                 tunnel_name,
             )
-            secret = await asyncio.to_thread(
-                _rotate_secret_by_name, self._inkbox, tunnel_name,
-            )
-            if secret is None:
-                logger.error(
-                    "[Inkbox] Couldn't rotate secret for tunnel %r — no "
-                    "matching tunnel returned by tunnels.list().",
-                    tunnel_name,
-                )
-                self._tunnel = None
-                return False
-            try:
-                self._tunnel = await asyncio.to_thread(
-                    inkbox_tunnel_connect,
-                    self._inkbox, secret=secret, **connect_kwargs,
-                )
-            except Exception:
-                logger.exception(
-                    "[Inkbox] Reconnect after secret rotation failed",
-                )
-                self._tunnel = None
-                return False
+            self._tunnel = None
+            return False
         except Exception:
             logger.exception("[Inkbox] Failed to open SDK tunnel")
             self._tunnel = None

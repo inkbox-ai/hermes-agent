@@ -65,7 +65,7 @@ dependencies = [
   # so a base install (no extras) that lacked the SDK would crash with
   # ModuleNotFoundError. Aiohttp powers the local webhook handler + the
   # WS bridge target for the SDK's tunnel runtime.
-  "inkbox>=0.3.2,<1",
+  "inkbox>=0.4.0,<1",
   "aiohttp>=3.9.0,<4",
 ]
 

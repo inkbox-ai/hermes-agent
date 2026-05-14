@@ -72,11 +72,16 @@ with Inkbox(api_key=os.environ["INKBOX_API_KEY"]) as ink:
 
 ```
 Inkbox (admin-only client)
-├── .create_identity(handle)  → AgentIdentity
+├── .create_identity(handle, *, display_name=, description=,
+│                    email_local_part=, sending_domain=,
+│                    tunnel=, phone_number=, vault_secret_ids=)
+│                              → AgentIdentity   (atomically creates mailbox + tunnel)
 ├── .get_identity(handle)     → AgentIdentity
 ├── .list_identities()        → list[AgentIdentitySummary]
-├── .mailboxes                → MailboxesResource
+├── .mailboxes                → MailboxesResource   (list/get/update/search; no create/delete)
 ├── .phone_numbers            → PhoneNumbersResource
+├── .tunnels                  → TunnelsResource     (list/get/update[metadata]/sign_csr)
+├── .api_keys                 → ApiKeysResource     (.create — mint identity-scoped keys)
 ├── .texts                    → TextsResource
 ├── .mail_contact_rules       → MailContactRulesResource
 ├── .phone_contact_rules      → PhoneContactRulesResource
@@ -87,15 +92,18 @@ Inkbox (admin-only client)
 └── .create_signing_key()     → SigningKey
 
 AgentIdentity (identity-scoped helper)
-├── .mailbox                 → IdentityMailbox | None
+├── .mailbox                 → IdentityMailbox          (always populated; 1:1 invariant)
+├── .tunnel                  → Tunnel                   (always populated; 1:1 invariant)
 ├── .phone_number            → IdentityPhoneNumber | None
 ├── .credentials             → Credentials  (requires vault unlocked)
-├── mail methods             (requires assigned mailbox)
+├── mail methods             (mailbox is always linked)
 ├── phone methods            (requires assigned phone number)
 └── text methods             (requires assigned phone number)
 ```
 
-An identity must have a channel assigned before you can use mail/phone methods. If not assigned, an `InkboxError` is raised with a clear message.
+**1:1:1 invariant.** Every live identity has exactly one mailbox and exactly one tunnel, created and deleted atomically with it. There are no longer standalone `mailboxes.create`/`delete` or `tunnels.create`/`delete`/`rotate_secret`/`restore` endpoints. Phone numbers remain optional and lifecycle-independent.
+
+**Global handle namespace.** `agent_handle` is globally unique across every Inkbox org and shares its namespace with tunnel names and platform-domain mailbox local-parts. Collisions raise `HandleUnavailableError(blocking_namespace=...)` on `create_identity` (see Error Handling below). The mailbox local part is forced to the handle on the platform domain (`@inkboxmail.com`); on a custom sending domain you can choose freely via `email_local_part=`. Once claimed, a handle is held permanently — soft-deleted identities still hold their slot, and identities on the platform domain cannot be renamed.
 
 ## Agent Signup
 
@@ -104,31 +112,48 @@ Public, no API key required: `Inkbox.signup(human_email, note_to_human, agent_ha
 ## Identities
 
 ```python
-identity = inkbox.create_identity("sales-agent")
+from inkbox import IdentityTunnelCreateOptions, IdentityPhoneNumberCreateOptions
+
+# Atomically provisions mailbox + tunnel; phone is optional.
+identity = inkbox.create_identity(
+    "sales-agent",
+    display_name="Sales Bot",                                   # optional
+    description="Inbound lead handler",                         # optional, org-internal
+    tunnel=IdentityTunnelCreateOptions(tls_mode="edge"),        # optional; "edge" is the default
+    phone_number=IdentityPhoneNumberCreateOptions(type="local", state="NY"),  # optional
+)
 identity = inkbox.get_identity("sales-agent")
 identities = inkbox.list_identities()  # → list[AgentIdentitySummary]
 
-identity.update(new_handle="new-name")   # rename
-identity.update(status="paused")         # or "active"
-identity.refresh()                       # re-fetch from API, updates cached channels
-identity.delete()                        # unlinks channels
+identity.update(display_name="Sales Bot v2")     # display_name now lives on the identity
+identity.update(status="paused")                 # or "active"
+identity.refresh()                               # re-fetch from API; updates cached channels
+identity.delete()                                # cascades to mailbox + tunnel + scoped API keys
 ```
+
+**Handles can't be renamed in practice.** Any identity with a platform-domain (`@inkboxmail.com`) mailbox — i.e. every identity created without an explicit custom `sending_domain` — rejects `identity.update(new_handle=...)` with a 409: the handle is load-bearing for the email address. To change a handle, `identity.delete()` and `create_identity(new_handle, ...)`.
 
 ## Channel Management
 
 ```python
-# Identity is created with a mailbox automatically — provision a phone number
+# Mailbox + tunnel are created atomically with the identity.
+print(identity.mailbox.email_address)  # e.g. "sales-agent@inkboxmail.com"
+print(identity.tunnel.public_host)     # e.g. "sales-agent.inkboxwire.com"
+
+# Provision a phone number (the only optional channel).
 phone = identity.provision_phone_number(type="toll_free")       # or type="local", state="NY"
-print(identity.email_address)  # e.g. "sales-agent@inkboxmail.com"
 print(phone.number)            # e.g. "+18005551234"
 
-# Link existing channels
-identity.assign_mailbox("mailbox-uuid")
+# Link / unlink an existing phone number.
 identity.assign_phone_number("phone-number-uuid")
-
-# Unlink without deleting
-identity.unlink_mailbox()
 identity.unlink_phone_number()
+```
+
+To switch an identity to a different handle/mailbox/tunnel, delete it and recreate — the deletion cascades through mailbox + tunnel + identity-scoped API keys and unlinks the phone:
+
+```python
+identity.delete()
+new_identity = inkbox.create_identity("new-handle", display_name="...")
 ```
 
 ## Mail
@@ -507,13 +532,17 @@ code = unlocked.get_totp_code(secret_id)
 
 ### Mailboxes (`inkbox.mailboxes`)
 
+Mailbox lifecycle is owned by the identity: `create_identity()` provisions one atomically, `identity.delete()` cascades. There is no `mailboxes.create()` or `mailboxes.delete()` — those endpoints return 404.
+
 ```python
 mailboxes = inkbox.mailboxes.list()
 mailbox   = inkbox.mailboxes.get("abc@inkboxmail.com")
 
-inkbox.mailboxes.update(mailbox.email_address, display_name="New Name")
 inkbox.mailboxes.update(mailbox.email_address, webhook_url="https://example.com/hook")
 inkbox.mailboxes.update(mailbox.email_address, webhook_url=None)   # remove webhook
+
+# `display_name` lives on the identity now — passing it to mailboxes.update
+# returns 422 with a hint. Use identity.update(display_name=...) instead.
 
 # Switch contact-rule filter mode (admin-only — agent-scoped keys get 403)
 updated = inkbox.mailboxes.update(mailbox.email_address, filter_mode="whitelist")
@@ -523,12 +552,45 @@ if updated.filter_mode_change_notice:
     n = updated.filter_mode_change_notice
     print(n.redundant_rule_count, n.redundant_rule_action, n.new_filter_mode)
 
-# Mailbox responses now also carry mailbox.agent_identity_id when the
-# mailbox is linked to an identity.
+# Mailbox responses carry mailbox.agent_identity_id (always populated for
+# live customer mailboxes; null only on tombstones or system mailboxes).
 
 results = inkbox.mailboxes.search(mailbox.email_address, q="invoice", limit=20)
-inkbox.mailboxes.delete(mailbox.email_address)
 ```
+
+### Tunnels (`inkbox.tunnels`)
+
+Like mailboxes, tunnel lifecycle is owned by the identity. The surviving control-plane operations are read + metadata-only update + CSR signing.
+
+```python
+tunnels = inkbox.tunnels.list()
+tunnel  = inkbox.tunnels.get("tunnel-uuid")
+
+# Metadata-only update — the only PATCH-able field is `metadata`.
+inkbox.tunnels.update("tunnel-uuid", metadata={"env": "prod"})
+
+# Sign a CSR (passthrough tunnels only; edge tunnels return 409 TunnelTLSModeMismatch)
+signed = inkbox.tunnels.sign_csr("tunnel-uuid", csr_pem=csr_bytes)
+```
+
+To open the data plane from your own code use `inkbox.tunnels.connect(...)` (or `inkbox.tunnels.client.connect`); auth is the SDK client's API key sent as `x-api-key`. No per-tunnel connect secret to mint or rotate. The key must be admin-scoped in the tunnel's org, or agent-scoped to the tunnel's owning identity.
+
+### API Keys (`inkbox.api_keys`)
+
+```python
+# Mint a fresh API key. Admin-scoped callers MUST pass scoped_identity_id
+# (admin keys cannot mint other admin keys — JWT only). Agent-scoped keys
+# are bound to a single identity for the life of the key.
+created = inkbox.api_keys.create(
+    label="Hermes gateway · sales-agent",
+    description="Auto-minted by hermes setup",
+    scoped_identity_id=identity.id,        # None → admin-scoped (JWT only)
+)
+print(created.api_key)     # the full secret — shown once, save immediately
+print(created.record.id)   # ApiKey record metadata
+```
+
+The minted key is what `tunnels.connect()` sends as `x-api-key` on the data plane, so the per-identity key from this call is exactly what a gateway running as one identity should hold on disk.
 
 ### Phone Numbers (`inkbox.phone_numbers`)
 
@@ -768,6 +830,9 @@ except InkboxAPIError as e:
 
 - `DuplicateContactRuleError` — 409 when creating a contact rule with an already-taken `(match_type, match_target)` on the same resource. Exposes `.existing_rule_id: UUID`.
 - `RedundantContactAccessGrantError` — 409 when a contact-access grant is redundant (e.g. per-identity grant on top of an active wildcard). Exposes `.error` and `.detail_message`.
+- `HandleUnavailableError` (from `inkbox.identities.exceptions`) — 409 from `create_identity()` when the requested `agent_handle` collides in the unified global namespace. Exposes `.blocking_namespace: Literal["identities","tunnels","mail",None]` so the caller can tell whether the collision was against an existing identity, an existing tunnel, or a platform-domain mailbox local-part. (Identities on the platform domain cannot be renamed, so this error effectively only fires at create time on this fork.)
+- `TunnelNotProvisioned` (from `inkbox.tunnels.exceptions`) — raised by `inkbox.tunnels.connect(...)` when no tunnel exists for the supplied handle. Recovery: recreate the identity (tunnels are atomically provisioned with it).
+- `TunnelRemoved` (from `inkbox.tunnels.exceptions`) — raised when the local `state.json` references a `tunnel_id` that the server returned 404 for. Clear the state directory and call `create_identity(...)`.
 
 ## Key Conventions
 
@@ -844,11 +909,10 @@ These commands can send real traffic or mutate real resources. Confirm with the 
 - `email send`
 - `text send`
 - `phone call`
-- `identity delete`
+- `identity delete` (cascades to its mailbox + tunnel + scoped API keys)
 - `email delete`
 - `email delete-thread`
 - `vault delete`
-- `mailbox delete`
 - `mailbox update --filter-mode ...` (admin-only; flips allow/block semantics for that mailbox)
 - `number release`
 - `number update --filter-mode ...` (admin-only; same caveat as mailbox)
@@ -874,16 +938,17 @@ inkbox signup status
 ```bash
 inkbox identity list
 inkbox identity get <handle>
-inkbox identity create <handle>
+inkbox identity create <handle> [--display-name <name>] [--description <text>]
 inkbox identity delete <handle>
-inkbox identity update <handle> --new-handle <handle>
+inkbox identity update <handle> [--display-name <name>] [--description <text>] [--status active|paused]
 inkbox identity refresh <handle>
 ```
 
 Notes:
 
-- Creating an identity creates the agent identity; mailbox creation is handled automatically by the backend flow described in the CLI docs.
-- `identity get` and `identity refresh` return mailbox and phone number assignments when present.
+- `identity create` atomically provisions the agent identity, its mailbox, and its tunnel. The handle is globally unique across all Inkbox orgs and is reused as the platform-domain mailbox local part and the tunnel name. A 409 means the handle collides somewhere in that shared namespace.
+- `identity get` and `identity refresh` return mailbox, tunnel, and phone number assignments.
+- `identity delete` cascades: mailbox + tunnel are tombstoned and any identity-scoped API keys are revoked.
 - Most email, phone, and text commands require `-i, --identity <handle>`.
 
 ### Identity-Scoped Secrets
@@ -1014,12 +1079,12 @@ Secret type flags:
 ```bash
 inkbox mailbox list
 inkbox mailbox get <email-address>
-inkbox mailbox create -i <handle> [--display-name <name>] [--local-part <part>]
-inkbox mailbox update <email-address> [--display-name <name>] [--webhook-url <url>] [--filter-mode whitelist|blacklist]
-inkbox mailbox delete <email-address>
+inkbox mailbox update <email-address> [--webhook-url <url>] [--filter-mode whitelist|blacklist]
 ```
 
-`mailbox list` / `get` / `update` rows now include `filterMode` and `agentIdentityId`. `--filter-mode` is admin-only; when the value actually changes, a note is printed to **stderr** telling you how many existing rules are now redundant under the new mode.
+Mailbox creation and deletion are owned by the identity now — use `inkbox identity create` / `inkbox identity delete`. `mailbox update` no longer accepts `--display-name`; that field moved to the identity (`inkbox identity update <handle> --display-name <name>`).
+
+`mailbox list` / `get` / `update` rows include `filterMode` and `agentIdentityId`. `--filter-mode` is admin-only; when the value actually changes, a note is printed to **stderr** telling you how many existing rules are now redundant under the new mode.
 
 ### Mailbox Contact Rules (`inkbox mailbox rules …`)
 

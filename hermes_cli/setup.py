@@ -2232,7 +2232,6 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
     note = "Setting up a Hermes agent on Inkbox."
     human_email: str = ""
     handle: str = ""
-    local_part: str | None = None  # None = not yet asked; "" = user opted into auto
 
     # Retry loop. Each known error class re-asks just the field at fault.
     while True:
@@ -2243,15 +2242,13 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
                 return None, "", False
 
         if not handle:
-            handle = prompt("  Desired agent handle (e.g. on-call-agent, recruiting-agent)").strip()
+            handle = prompt(
+                "  Desired agent handle (e.g. on-call-agent, recruiting-agent) — "
+                "globally unique, also becomes the mailbox local part"
+            ).strip()
             if not handle:
                 print_error("  Agent handle is required.")
                 return None, "", False
-
-        if local_part is None:
-            local_part = prompt(
-                "  Mailbox local part (e.g. 'recruiting' for recruiting@inkboxmail.com — leave empty for auto)"
-            ).strip()
 
         print()
         print_info("Calling agent-signup…")
@@ -2260,7 +2257,6 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
                 human_email=human_email,
                 note_to_human=note,
                 agent_handle=handle,
-                email_local_part=local_part or None,
                 base_url=base_url,
             )
             break  # success, fall through to verification
@@ -2282,14 +2278,20 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
                     continue
                 return None, "", False
 
-            if e.status_code in (409, 422) and ("email address" in detail_lc or "local" in detail_lc):
+            # 409 on signup means the handle collided in the global namespace
+            # (identities / tunnels / platform mailbox local-parts). The
+            # message text was softened server-side to "is unavailable".
+            if e.status_code == 409 or (
+                e.status_code == 422 and ("handle" in detail_lc or "unavailable" in detail_lc)
+            ):
                 ctx = (
                     f"Signup blocked: HTTP {e.status_code} — {detail}\n\n"
-                    f"That mailbox local part is taken or reserved. Pick another.\n\n"
-                    f"Local part tried: {local_part or '(auto-generated)'}"
+                    f"Agent handles are globally unique (shared namespace with\n"
+                    f"tunnels and platform mailbox local parts). Pick another.\n\n"
+                    f"Handle tried: {handle}"
                 )
-                if _inkbox_retry_or_abort("Pick a different local part", error_context=ctx):
-                    local_part = None
+                if _inkbox_retry_or_abort("Pick a different handle", error_context=ctx):
+                    handle = ""
                     continue
                 return None, "", False
 
@@ -2297,12 +2299,10 @@ def _inkbox_self_signup_flow(base_url, Inkbox, InkboxAPIError):
                 f"Signup failed: HTTP {e.status_code} — {detail}\n\n"
                 f"Inputs tried:\n"
                 f"  Email:  {human_email}\n"
-                f"  Handle: {handle}\n"
-                f"  Local:  {local_part or '(auto-generated)'}"
+                f"  Handle: {handle}"
             )
             if _inkbox_retry_or_abort("Re-enter all details and try again", error_context=ctx):
                 human_email = handle = ""
-                local_part = None
                 continue
             return None, "", False
         except Exception as e:
@@ -2645,27 +2645,34 @@ def _inkbox_pick_admin_scoped(client, api_key, IdentityPhoneNumberCreateOptions,
 
 
 def _inkbox_create_identity(client, api_key, IdentityPhoneNumberCreateOptions, InkboxAPIError):
-    """Collect handle / mailbox / optional-phone and call create_identity().
+    """Collect handle / display-name / optional-phone and call create_identity().
+
+    Mailbox and tunnel are provisioned atomically by the server; on the
+    platform domain the mailbox local part is forced to ``agent_handle``,
+    so we no longer prompt for one separately.
 
     Returns ``(identity, api_key, did_provision_phone)`` on success,
     ``(None, "", False)`` on abort.
     """
+    # Imported here rather than at module scope to keep the inkbox
+    # dependency lazy (matches every other inkbox import in this file).
+    from inkbox.identities.exceptions import HandleUnavailableError
+
     print()
     print_header("Create new agent identity")
 
     while True:
-        handle = prompt("  Agent handle (e.g. on-call-agent, recruiting-agent)").strip()
+        handle = prompt(
+            "  Agent handle (e.g. on-call-agent, recruiting-agent) — "
+            "globally unique, also the mailbox local part"
+        ).strip()
         if not handle:
             print_error("  Handle is required.")
             continue
         break
 
-    local_part = prompt(
-        "  Mailbox local part (e.g. 'recruiting' for recruiting@inkboxmail.com — leave empty for auto)"
-    ).strip()
-
     display_name = prompt(
-        "  Display name for the mailbox (shown to recipients, optional)"
+        "  Display name for the identity (shown to recipients, optional)"
     ).strip()
 
     print()
@@ -2686,25 +2693,22 @@ def _inkbox_create_identity(client, api_key, IdentityPhoneNumberCreateOptions, I
     while True:
         try:
             identity = client.create_identity(
-                agent_handle=handle,
-                create_mailbox=True,
+                handle,
                 display_name=display_name or None,
-                email_local_part=local_part or None,
                 phone_number=phone_opts,
             )
             break
+        except HandleUnavailableError as e:
+            # Globally-unique handles share namespace with tunnels + platform
+            # mailboxes; ``blocking_namespace`` tells us which side rejected.
+            ns = e.blocking_namespace or "the global namespace"
+            print_error(f"  Handle '{handle}' is unavailable in {ns}.")
+            handle = prompt("  Pick a different handle").strip()
+            if not handle:
+                return None, "", False
+            continue
         except InkboxAPIError as e:
             print_error(f"  Creation failed: HTTP {e.status_code} {e.detail}")
-            # Common case: handle or mailbox already taken.
-            detail_lc = (str(e.detail) or "").lower()
-            if "handle" in detail_lc and "taken" in detail_lc:
-                handle = prompt("  Pick a different handle").strip()
-                if not handle:
-                    return None, "", False
-                continue
-            if "mailbox" in detail_lc or "local_part" in detail_lc:
-                local_part = prompt("  Pick a different mailbox local part (or empty for auto)").strip()
-                continue
             return None, "", False
         except Exception as e:
             print_error(f"  Creation failed: {e}")
