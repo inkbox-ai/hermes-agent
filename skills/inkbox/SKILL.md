@@ -94,7 +94,7 @@ Admin-only resources also exist on the client (`mailboxes`, `phone_numbers`, `tu
 
 **1:1:1 invariant.** Every live identity has exactly one mailbox and exactly one tunnel, created and deleted atomically with it. There are no longer standalone `mailboxes.create`/`delete` or `tunnels.create`/`delete`/`rotate_secret`/`restore` endpoints. Phone numbers remain optional and lifecycle-independent.
 
-**Global handle namespace.** `agent_handle` is globally unique across every Inkbox org and shares its namespace with tunnel names and platform-domain mailbox local-parts. Collisions raise `HandleUnavailableError(blocking_namespace=...)` on `create_identity` (see Error Handling below). The mailbox local part is forced to the handle on the platform domain (`@inkboxmail.com`); on a custom sending domain you can choose freely via `email_local_part=`. Once claimed, a handle is held permanently — soft-deleted identities still hold their slot, and identities on the platform domain cannot be renamed.
+**Global handle namespace.** `agent_handle` is globally unique across every Inkbox org and shares its namespace with tunnel names and platform-domain mailbox local-parts. Collisions raise `HandleUnavailableError(blocking_namespace=...)` on `create_identity` (see Error Handling below). The mailbox local part is forced to the handle on the platform domain (`@inkboxmail.com`); on a custom sending domain you can choose freely via `email_local_part=`. Once claimed, a handle is held permanently — and identities on the platform domain cannot be renamed.
 
 ## Your Identity
 
