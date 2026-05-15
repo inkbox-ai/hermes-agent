@@ -104,14 +104,13 @@ except ImportError:
     inkbox_tunnel_connect = None  # type: ignore[assignment]
     INKBOX_TUNNEL_AVAILABLE = False
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import INKBOX_BASE_URL_DEFAULT, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
-DEFAULT_BASE_URL = "https://inkbox.ai"
 DEFAULT_WEBHOOK_PATH = "/webhook"
 DEFAULT_WS_PATH = "/phone/media/ws"
 CONTACT_CACHE_TTL_SECONDS = 300
@@ -258,7 +257,7 @@ class InkboxAdapter(BasePlatformAdapter):
             extra.get("identity") or os.getenv("INKBOX_IDENTITY") or ""
         ).strip()
         self._base_url = (
-            extra.get("base_url") or os.getenv("INKBOX_BASE_URL") or DEFAULT_BASE_URL
+            extra.get("base_url") or os.getenv("INKBOX_BASE_URL") or INKBOX_BASE_URL_DEFAULT
         ).strip()
         self._host = str(extra.get("host") or os.getenv("INKBOX_HOST") or DEFAULT_HOST)
         self._port = int(
@@ -1636,7 +1635,7 @@ async def send_inkbox_direct(
     if not handle:
         return {"error": "INKBOX_IDENTITY not set"}
     base_url = (
-        extra.get("base_url") or os.getenv("INKBOX_BASE_URL") or DEFAULT_BASE_URL
+        extra.get("base_url") or os.getenv("INKBOX_BASE_URL") or INKBOX_BASE_URL_DEFAULT
     )
 
     def _do_send() -> Dict[str, Any]:

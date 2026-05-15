@@ -1919,7 +1919,8 @@ def _setup_inkbox():
         if not prompt_yes_no("  Reconfigure Inkbox?", False):
             return
 
-    base_url = os.getenv("INKBOX_BASE_URL") or get_env_value("INKBOX_BASE_URL") or "https://inkbox.ai"
+    from gateway.config import INKBOX_BASE_URL_DEFAULT
+    base_url = os.getenv("INKBOX_BASE_URL") or get_env_value("INKBOX_BASE_URL") or INKBOX_BASE_URL_DEFAULT
 
     # ── Branch by API-key availability ──
     print()
