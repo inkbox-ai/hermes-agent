@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import suppress
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,6 +13,7 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
+from gateway.session import build_session_key
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +520,69 @@ class TestWebhookRouting:
         assert "[+11s] extra detail" in ev.text
         assert ev.message_id == "sms-burst-3"
         assert ev.source.message_id == "sms-burst-3"
+
+    @pytest.mark.asyncio
+    async def test_sms_batch_pre_agent_hook_payload_is_one_turn(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, sms_text_batch_delay_seconds=60)
+        captured = []
+
+        async def fake_handle_message(event):
+            captured.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+        def envelope(text_id, text, created_at):
+            return {
+                "event_type": "text.received",
+                "data": {"text_message": {
+                    "id": text_id,
+                    "remote_phone_number": "+15555550101",
+                    "local_phone_number": "+18005550100",
+                    "text": text,
+                    "direction": "inbound",
+                    "created_at": created_at,
+                }},
+            }
+
+        for payload in [
+            envelope("sms-burst-1", "Need a plumber", "2026-04-27T20:00:00Z"),
+            envelope("sms-burst-2", "Kitchen sink leak", "2026-04-27T20:00:06Z"),
+            envelope("sms-burst-3", "Ashburn", "2026-04-27T20:00:11Z"),
+        ]:
+            await adapter._handle_webhook(_FakeRequest(json.dumps(payload).encode()))
+
+        key = next(iter(adapter._pending_sms_text_batches))
+        await adapter._flush_sms_text_batch_now(key)
+        await _drain_background(adapter)
+
+        assert len(captured) == 1
+        ev = captured[0]
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        now = datetime.now(timezone.utc)
+        session_entry = SimpleNamespace(
+            session_id="sess-burst",
+            created_at=now,
+            updated_at=now,
+        )
+        payload = runner._build_pre_agent_hook_payload(
+            event=ev,
+            source=ev.source,
+            session_entry=session_entry,
+            session_key=build_session_key(ev.source),
+            was_auto_reset=False,
+            auto_reset_reason=None,
+        )
+
+        assert payload["channel"] == "sms"
+        assert payload["message"]["body_text"].startswith("[inkbox:sms_burst messages=3 ")
+        assert payload["sms"]["message_count"] == 3
+        assert [f["body_text"] for f in payload["sms"]["fragments"]] == [
+            "Need a plumber",
+            "Kitchen sink leak",
+            "Ashburn",
+        ]
 
     @pytest.mark.asyncio
     async def test_sms_slash_command_bypasses_batching_and_marker(self, monkeypatch):

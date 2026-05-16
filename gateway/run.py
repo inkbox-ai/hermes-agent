@@ -40,7 +40,7 @@ import time
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -7224,11 +7224,462 @@ class GatewayRunner:
                 pass
         return source
 
+    @staticmethod
+    def _pre_agent_hook_platform_value(source) -> str:
+        platform = getattr(source, "platform", None)
+        return str(getattr(platform, "value", platform) or "").lower()
+
+    def _pre_agent_hook_channel(self, event: MessageEvent) -> str:
+        if self._is_inkbox_sms_event(event):
+            return "sms"
+        message_type = getattr(event, "message_type", None)
+        return str(getattr(message_type, "value", message_type) or "text").lower()
+
+    def _pre_agent_hook_config(self):
+        return getattr(getattr(self, "config", None), "pre_agent_hook", None)
+
+    def _pre_agent_hook_enabled(self, source, event: MessageEvent) -> bool:
+        hook_config = self._pre_agent_hook_config()
+        if not hook_config:
+            return False
+        if not bool(getattr(hook_config, "enabled", False)):
+            return False
+        if not str(getattr(hook_config, "command", "") or "").strip():
+            return False
+
+        platforms = tuple(getattr(hook_config, "platforms", ()) or ())
+        # Empty platform filter is intentionally disabled-by-default.
+        if not platforms:
+            return False
+        platform_value = self._pre_agent_hook_platform_value(source)
+        if platform_value not in {str(item).strip().lower() for item in platforms}:
+            return False
+
+        channels = tuple(getattr(hook_config, "channels", ()) or ())
+        if channels:
+            channel = self._pre_agent_hook_channel(event)
+            if channel not in {str(item).strip().lower() for item in channels}:
+                return False
+        return True
+
+    @staticmethod
+    def _pre_agent_hook_iso(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        text = str(value).strip()
+        return text or None
+
+    @staticmethod
+    def _pre_agent_hook_parse_time(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _pre_agent_hook_body_preview(text: str, *, limit: int = 180) -> str:
+        preview_parts: list[str] = []
+        for raw_line in str(text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("[inkbox:sms"):
+                continue
+            if line.startswith("[+") and "] " in line:
+                line = line.split("] ", 1)[1].strip()
+            preview_parts.append(line)
+        preview = " / ".join(preview_parts) or str(text or "").replace("\n", " ")
+        if len(preview) > limit:
+            return preview[: limit - 1].rstrip() + "…"
+        return preview
+
+    @staticmethod
+    def _pre_agent_hook_inkbox_text_messages(raw_message: Any) -> list[dict]:
+        if not isinstance(raw_message, dict):
+            return []
+        envelopes = raw_message.get("items")
+        if not isinstance(envelopes, list):
+            envelopes = [raw_message]
+        messages: list[dict] = []
+        for envelope in envelopes:
+            if not isinstance(envelope, dict):
+                continue
+            data = envelope.get("data")
+            if not isinstance(data, dict):
+                continue
+            text_message = data.get("text_message")
+            if isinstance(text_message, dict):
+                messages.append(text_message)
+        return messages
+
+    def _build_pre_agent_sms_payload(
+        self,
+        *,
+        event: MessageEvent,
+        source,
+        text_messages: list[dict],
+        received_at: Optional[str],
+    ) -> dict:
+        fragments: list[dict] = []
+        first_dt = None
+        if text_messages:
+            first_dt = self._pre_agent_hook_parse_time(
+                text_messages[0].get("created_at")
+            )
+        for index, text_message in enumerate(text_messages):
+            created_at = self._pre_agent_hook_iso(text_message.get("created_at"))
+            created_dt = self._pre_agent_hook_parse_time(text_message.get("created_at"))
+            offset = None
+            if first_dt is not None and created_dt is not None:
+                offset = int((created_dt - first_dt).total_seconds())
+            fragments.append({
+                "text_id": str(text_message.get("id") or ""),
+                "offset_seconds": offset if offset is not None else index,
+                "received_at": created_at,
+                "body_text": str(text_message.get("text") or ""),
+            })
+
+        if not fragments:
+            fragments.append({
+                "text_id": str(getattr(event, "message_id", None) or ""),
+                "offset_seconds": 0,
+                "received_at": received_at,
+                "body_text": str(getattr(event, "text", "") or ""),
+            })
+
+        first_at = fragments[0].get("received_at") or received_at
+        last_at = fragments[-1].get("received_at") or received_at
+        platform = self._pre_agent_hook_platform_value(source)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        message_id = str(getattr(event, "message_id", "") or "")
+        is_burst = len(fragments) > 1 or str(getattr(event, "text", "")).startswith(
+            "[inkbox:sms_burst "
+        )
+        return {
+            "is_burst": is_burst,
+            "burst_id": f"{platform}:{chat_id}:{first_at}:{message_id}",
+            "message_count": len(fragments),
+            "first_at": first_at,
+            "last_at": last_at,
+            "fragments": fragments,
+        }
+
+    def _build_pre_agent_hook_payload(
+        self,
+        *,
+        event: MessageEvent,
+        source,
+        session_entry,
+        session_key: str,
+        was_auto_reset: bool,
+        auto_reset_reason: Optional[str],
+    ) -> dict:
+        platform = self._pre_agent_hook_platform_value(source)
+        channel = self._pre_agent_hook_channel(event)
+        raw_message = getattr(event, "raw_message", None)
+        text_messages = self._pre_agent_hook_inkbox_text_messages(raw_message)
+        text_message = text_messages[-1] if text_messages else {}
+        event_type = raw_message.get("event_type") if isinstance(raw_message, dict) else None
+        message_id = (
+            getattr(event, "message_id", None)
+            or getattr(source, "message_id", None)
+            or text_message.get("id")
+            or ""
+        )
+        received_at = (
+            self._pre_agent_hook_iso(getattr(event, "timestamp", None))
+            or self._pre_agent_hook_iso(text_message.get("created_at"))
+            or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+        if platform == Platform.INKBOX.value and message_id:
+            idempotency_key = f"inkbox:text:{message_id}"
+        else:
+            idempotency_key = f"{platform}:{channel}:{message_id or received_at}"
+
+        source_payload = {
+            "chat_id": getattr(source, "chat_id", None),
+            "chat_type": getattr(source, "chat_type", None),
+            "user_id": getattr(source, "user_id", None),
+            "user_name": getattr(source, "user_name", None),
+            "user_id_alt": getattr(source, "user_id_alt", None),
+            "thread_id": getattr(source, "thread_id", None),
+            "message_id": message_id or None,
+        }
+        provider_payload = {
+            "name": platform,
+            "event_type": event_type,
+            "request_id": raw_message.get("request_id") if isinstance(raw_message, dict) else None,
+            "contact_id": getattr(source, "chat_id", None),
+            "contact_name": getattr(source, "user_name", None),
+            "phone_alias": getattr(source, "user_id_alt", None),
+            "local_phone_number": text_message.get("local_phone_number"),
+            "text_id": text_message.get("id") or message_id or None,
+        }
+        text = str(getattr(event, "text", "") or "")
+        payload = {
+            "schema_version": "hermes.pre_agent_turn.v1",
+            "hook": "pre_agent_turn",
+            "idempotency_key": idempotency_key,
+            "platform": platform,
+            "channel": channel,
+            "direction": "inbound",
+            "execution": {
+                "surface": "live_gateway",
+                "handler_return_delivery": "adapter_sends_non_empty_text",
+                "post_agent_gate_available": False,
+            },
+            "received_at": received_at,
+            "source": source_payload,
+            "hermes_session": {
+                "session_key": session_key,
+                "session_id": getattr(session_entry, "session_id", None),
+                "is_new_session": bool(
+                    getattr(session_entry, "created_at", None)
+                    == getattr(session_entry, "updated_at", None)
+                ),
+                "was_auto_reset": bool(was_auto_reset),
+                "auto_reset_reason": auto_reset_reason,
+            },
+            "provider": provider_payload,
+            "message": {
+                "body_text": text,
+                "body_preview": self._pre_agent_hook_body_preview(text),
+                "agent_prompt_body_allowed": False,
+            },
+            "media": [
+                {
+                    "url": url,
+                    "content_type": (
+                        event.media_types[index]
+                        if index < len(getattr(event, "media_types", []) or [])
+                        else None
+                    ),
+                    "source_text_id": message_id or None,
+                }
+                for index, url in enumerate(getattr(event, "media_urls", []) or [])
+            ],
+        }
+        if channel == "sms":
+            payload["sms"] = self._build_pre_agent_sms_payload(
+                event=event,
+                source=source,
+                text_messages=text_messages,
+                received_at=received_at,
+            )
+        return payload
+
+    async def _run_pre_agent_hook(self, payload: dict) -> dict:
+        hook_config = self._pre_agent_hook_config()
+        command = str(getattr(hook_config, "command", "") or "").strip()
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = []
+        command_name = Path(argv[0]).name if argv else "<invalid>"
+        log_fields = {
+            "platform": payload.get("platform"),
+            "channel": payload.get("channel"),
+            "session_key": (payload.get("hermes_session") or {}).get("session_key"),
+            "message_id": (payload.get("source") or {}).get("message_id"),
+        }
+        if not argv:
+            logger.warning(
+                "pre_agent_hook failed closed: invalid_command "
+                "platform=%s channel=%s session_key=%s message_id=%s command=%s",
+                log_fields["platform"],
+                log_fields["channel"],
+                log_fields["session_key"],
+                log_fields["message_id"],
+                command_name,
+            )
+            return {"ok": False, "action": "hold", "_hermes_failure": "invalid_command"}
+
+        timeout = float(getattr(hook_config, "timeout_seconds", 3.0) or 3.0)
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _stderr = await asyncio.wait_for(
+                proc.communicate(
+                    json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            if proc is not None:
+                proc.kill()
+                await proc.wait()
+            logger.warning(
+                "pre_agent_hook failed closed: timeout "
+                "platform=%s channel=%s session_key=%s message_id=%s command=%s",
+                log_fields["platform"],
+                log_fields["channel"],
+                log_fields["session_key"],
+                log_fields["message_id"],
+                command_name,
+            )
+            return {"ok": False, "action": "hold", "_hermes_failure": "timeout"}
+        except Exception as exc:
+            logger.warning(
+                "pre_agent_hook failed closed: execution_error=%s "
+                "platform=%s channel=%s session_key=%s message_id=%s command=%s",
+                type(exc).__name__,
+                log_fields["platform"],
+                log_fields["channel"],
+                log_fields["session_key"],
+                log_fields["message_id"],
+                command_name,
+            )
+            return {"ok": False, "action": "hold", "_hermes_failure": "execution_error"}
+
+        if proc.returncode != 0:
+            logger.warning(
+                "pre_agent_hook failed closed: nonzero_exit=%s "
+                "platform=%s channel=%s session_key=%s message_id=%s command=%s",
+                proc.returncode,
+                log_fields["platform"],
+                log_fields["channel"],
+                log_fields["session_key"],
+                log_fields["message_id"],
+                command_name,
+            )
+            return {"ok": False, "action": "hold", "_hermes_failure": "nonzero_exit"}
+
+        try:
+            result = json.loads(stdout.decode("utf-8"))
+        except Exception:
+            logger.warning(
+                "pre_agent_hook failed closed: malformed_json "
+                "platform=%s channel=%s session_key=%s message_id=%s command=%s",
+                log_fields["platform"],
+                log_fields["channel"],
+                log_fields["session_key"],
+                log_fields["message_id"],
+                command_name,
+            )
+            return {"ok": False, "action": "hold", "_hermes_failure": "malformed_json"}
+        if not isinstance(result, dict):
+            logger.warning(
+                "pre_agent_hook failed closed: invalid_response "
+                "platform=%s channel=%s session_key=%s message_id=%s command=%s",
+                log_fields["platform"],
+                log_fields["channel"],
+                log_fields["session_key"],
+                log_fields["message_id"],
+                command_name,
+            )
+            return {"ok": False, "action": "hold", "_hermes_failure": "invalid_response"}
+        return result
+
+    def _apply_pre_agent_hook_result(
+        self,
+        result: dict,
+        *,
+        context_prompt: str,
+        source,
+        event: MessageEvent,
+        session_key: str,
+    ) -> tuple[str, str, Optional[str]]:
+        platform = self._pre_agent_hook_platform_value(source)
+        channel = self._pre_agent_hook_channel(event)
+        message_id = str(getattr(event, "message_id", "") or "")
+        outbound = result.get("outbound") if isinstance(result.get("outbound"), dict) else {}
+        action = str(result.get("action") or "").strip().lower()
+        outbound_mode = str(outbound.get("mode") or "").strip().lower()
+        ok = result.get("ok") is True
+
+        if not ok or action not in {"hold", "reply", "continue"}:
+            action = "hold"
+
+        live_inkbox_sms = platform == Platform.INKBOX.value and channel == "sms"
+        if live_inkbox_sms and (action == "continue" or outbound_mode == "generate_draft"):
+            logger.warning(
+                "pre_agent_hook policy hold: generated live Inkbox SMS requires "
+                "a post-agent response gate platform=%s channel=%s "
+                "session_key=%s message_id=%s",
+                platform,
+                channel,
+                session_key,
+                message_id,
+            )
+            action = "hold"
+
+        if action == "reply":
+            text = outbound.get("text")
+            if not isinstance(text, str):
+                logger.warning(
+                    "pre_agent_hook failed closed: reply_missing_text "
+                    "platform=%s channel=%s session_key=%s message_id=%s",
+                    platform,
+                    channel,
+                    session_key,
+                    message_id,
+                )
+                action = "hold"
+            else:
+                logger.info(
+                    "pre_agent_hook result platform=%s channel=%s "
+                    "session_key=%s message_id=%s action=reply",
+                    platform,
+                    channel,
+                    session_key,
+                    message_id,
+                )
+                return "reply", context_prompt, text
+
+        if action == "continue":
+            hydration = result.get("hydration")
+            prompt_context = (
+                hydration.get("prompt_context")
+                if isinstance(hydration, dict)
+                else None
+            )
+            if isinstance(prompt_context, str) and prompt_context.strip():
+                context_prompt = (
+                    f"{context_prompt}\n\n{prompt_context.strip()}"
+                    if context_prompt
+                    else prompt_context.strip()
+                )
+            logger.info(
+                "pre_agent_hook result platform=%s channel=%s "
+                "session_key=%s message_id=%s action=continue",
+                platform,
+                channel,
+                session_key,
+                message_id,
+            )
+            return "continue", context_prompt, None
+
+        logger.info(
+            "pre_agent_hook result platform=%s channel=%s "
+            "session_key=%s message_id=%s action=hold",
+            platform,
+            channel,
+            session_key,
+            message_id,
+        )
+        return "hold", context_prompt, None
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
+        if self._is_inkbox_sms_event(event):
+            _msg_preview = "[inkbox sms redacted]"
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
@@ -7264,6 +7715,13 @@ class GatewayRunner:
                     self._record_telegram_topic_binding(source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+        _pre_hook_was_auto_reset = bool(getattr(session_entry, "was_auto_reset", False))
+        _pre_hook_auto_reset_reason = (
+            getattr(session_entry, "auto_reset_reason", None)
+            if _pre_hook_was_auto_reset
+            else None
+        )
+
         if getattr(session_entry, "was_auto_reset", False):
             # Treat auto-reset as a full conversation boundary — drop every
             # session-scoped transient state so the fresh session does not
@@ -7372,6 +7830,42 @@ class GatewayRunner:
 
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
+
+        if self._pre_agent_hook_enabled(source, event):
+            try:
+                pre_agent_payload = self._build_pre_agent_hook_payload(
+                    event=event,
+                    source=source,
+                    session_entry=session_entry,
+                    session_key=session_key,
+                    was_auto_reset=_pre_hook_was_auto_reset,
+                    auto_reset_reason=_pre_hook_auto_reset_reason,
+                )
+                pre_agent_result = await self._run_pre_agent_hook(pre_agent_payload)
+                hook_action, context_prompt, exact_reply = self._apply_pre_agent_hook_result(
+                    pre_agent_result,
+                    context_prompt=context_prompt,
+                    source=source,
+                    event=event,
+                    session_key=session_key,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "pre_agent_hook failed closed: internal_error=%s "
+                    "platform=%s channel=%s session_key=%s message_id=%s",
+                    type(exc).__name__,
+                    self._pre_agent_hook_platform_value(source),
+                    self._pre_agent_hook_channel(event),
+                    session_key,
+                    getattr(event, "message_id", None),
+                )
+                hook_action, exact_reply = "hold", None
+            if hook_action == "hold":
+                self._clear_session_env(_session_env_tokens)
+                return None
+            if hook_action == "reply":
+                self._clear_session_env(_session_env_tokens)
+                return exact_reply
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.

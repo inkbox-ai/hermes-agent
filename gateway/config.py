@@ -62,6 +62,24 @@ def _coerce_int(value: Any, default: int) -> int:
         return default
 
 
+def _coerce_string_tuple(value: Any) -> tuple[str, ...]:
+    """Normalize list-or-comma-string config values to lowercase strings."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        items = value
+    else:
+        items = [value]
+    normalized = []
+    for item in items:
+        text = str(item).strip().lower()
+        if text:
+            normalized.append(text)
+    return tuple(normalized)
+
+
 def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> str:
     """Normalize unauthorized DM behavior to a supported value."""
     if isinstance(value, str):
@@ -407,6 +425,41 @@ class StreamingConfig:
         )
 
 
+@dataclass
+class PreAgentHookConfig:
+    """Configuration for an external pre-agent-turn hook."""
+
+    enabled: bool = False
+    command: str = ""
+    timeout_seconds: float = 3.0
+    platforms: tuple[str, ...] = ()
+    channels: tuple[str, ...] = ()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "command": self.command,
+            "timeout_seconds": self.timeout_seconds,
+            "platforms": list(self.platforms),
+            "channels": list(self.channels),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PreAgentHookConfig":
+        if not isinstance(data, dict):
+            data = {}
+        return cls(
+            enabled=_coerce_bool(data.get("enabled"), False),
+            command=str(data.get("command") or "").strip(),
+            timeout_seconds=max(
+                _coerce_float(data.get("timeout_seconds"), 3.0),
+                0.1,
+            ),
+            platforms=_coerce_string_tuple(data.get("platforms")),
+            channels=_coerce_string_tuple(data.get("channels")),
+        )
+
+
 # -----------------------------------------------------------------------------
 # Built-in platform connection checkers
 # -----------------------------------------------------------------------------
@@ -489,6 +542,10 @@ class GatewayConfig:
 
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
+
+    # Product-neutral external hook that can persist/classify/hydrate a turn
+    # before the agent sees it. Disabled by default and platform-filtered.
+    pre_agent_hook: PreAgentHookConfig = field(default_factory=PreAgentHookConfig)
 
     # Session store pruning: drop SessionEntry records older than this many
     # days from the in-memory dict and sessions.json.  Keeps the store from
@@ -589,6 +646,7 @@ class GatewayConfig:
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
+            "pre_agent_hook": self.pre_agent_hook.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
         }
     
@@ -657,6 +715,7 @@ class GatewayConfig:
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
+            pre_agent_hook=PreAgentHookConfig.from_dict(data.get("pre_agent_hook", {})),
             session_store_max_age_days=session_store_max_age_days,
         )
 
@@ -752,6 +811,17 @@ def load_gateway_config() -> GatewayConfig:
                 streaming_cfg = yaml_cfg.get("gateway", {}).get("streaming")
             if isinstance(streaming_cfg, dict):
                 gw_data["streaming"] = streaming_cfg
+
+            gateway_cfg = yaml_cfg.get("gateway")
+            pre_agent_hook_cfg = (
+                gateway_cfg.get("pre_agent_hook")
+                if isinstance(gateway_cfg, dict)
+                else None
+            )
+            if not isinstance(pre_agent_hook_cfg, dict):
+                pre_agent_hook_cfg = yaml_cfg.get("pre_agent_hook")
+            if isinstance(pre_agent_hook_cfg, dict):
+                gw_data["pre_agent_hook"] = pre_agent_hook_cfg
 
             if "reset_triggers" in yaml_cfg:
                 gw_data["reset_triggers"] = yaml_cfg["reset_triggers"]
@@ -1249,6 +1319,28 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
 
 def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to config."""
+
+    # Generic pre-agent-turn external hook.
+    if "HERMES_PRE_AGENT_HOOK_ENABLED" in os.environ:
+        config.pre_agent_hook.enabled = _coerce_bool(
+            os.getenv("HERMES_PRE_AGENT_HOOK_ENABLED"),
+            False,
+        )
+    if "HERMES_PRE_AGENT_HOOK_COMMAND" in os.environ:
+        config.pre_agent_hook.command = os.getenv("HERMES_PRE_AGENT_HOOK_COMMAND", "").strip()
+    if "HERMES_PRE_AGENT_HOOK_TIMEOUT_SECONDS" in os.environ:
+        config.pre_agent_hook.timeout_seconds = max(
+            _coerce_float(os.getenv("HERMES_PRE_AGENT_HOOK_TIMEOUT_SECONDS"), 3.0),
+            0.1,
+        )
+    if "HERMES_PRE_AGENT_HOOK_PLATFORMS" in os.environ:
+        config.pre_agent_hook.platforms = _coerce_string_tuple(
+            os.getenv("HERMES_PRE_AGENT_HOOK_PLATFORMS", "")
+        )
+    if "HERMES_PRE_AGENT_HOOK_CHANNELS" in os.environ:
+        config.pre_agent_hook.channels = _coerce_string_tuple(
+            os.getenv("HERMES_PRE_AGENT_HOOK_CHANNELS", "")
+        )
     
     # Telegram
     telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
