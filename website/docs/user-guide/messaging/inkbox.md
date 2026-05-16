@@ -24,6 +24,8 @@ Hermes uses the resolved Inkbox Contact as the primary `chat_id` when possible. 
 
 Inbound SMS can be buffered per contact before Hermes starts an agent turn. The quiet window is disabled by default so upstream deployments keep immediate SMS behavior; set `sms_text_batch_delay_seconds` or `INKBOX_SMS_TEXT_BATCH_DELAY_SECONDS` to a positive number when a deployment wants rapid human fragments, corrections, and follow-ups to arrive as one prompt instead of several competing prompts. A multi-message turn uses an `inkbox:sms_burst` routing marker and includes relative timestamps for each fragment.
 
+If an SMS turn arrives while Hermes is already running for that contact, the gateway queues it for the next turn and merges later SMS follow-ups into the same pending prompt. SMS follow-ups do not interrupt the active run by default.
+
 Slash commands bypass SMS batching and routing markers, so a text such as `/approve` or `/deny` reaches the Hermes command parser as a command rather than tagged SMS body text. Carrier protocol words such as `START`, `STOP`, `HELP`, `YES`, `SUBSCRIBE`, `INFO`, and `UNSUBSCRIBE` are treated as SMS control traffic and are acknowledged at the webhook layer without starting an agent turn.
 
 Outbound SMS is queued with `identity.send_text(to=..., text=...)`. The adapter returns a `SendResult` with the Inkbox text id and non-body metadata such as `delivery_status`.

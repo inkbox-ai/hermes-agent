@@ -259,7 +259,7 @@ When the callee picks up, audio bridges to the *same* WS handler as inbound call
 
 ## Text Messages (SMS/MMS)
 
-In Hermes-routed Inkbox sessions, inbound human SMS fragments are buffered per contact before the agent is prompted. Multi-message bursts are delivered as one prompt with an `[inkbox:sms_burst ...]` marker and relative fragment timestamps. Slash commands such as `/approve` and `/deny` bypass that marker so Hermes sees command text rather than tagged SMS body text; carrier control words such as `START`, `STOP`, and `HELP` are protocol traffic and should not be treated as agent instructions.
+In Hermes-routed Inkbox sessions, inbound human SMS fragments are buffered per contact before the agent is prompted. Multi-message bursts are delivered as one prompt with an `[inkbox:sms_burst ...]` marker and relative fragment timestamps. If SMS arrives while an agent run is already active for that contact, Hermes queues it for the next turn and merges later SMS follow-ups into the same pending prompt instead of interrupting the active run. Slash commands such as `/approve` and `/deny` bypass that marker so Hermes sees command text rather than tagged SMS body text; carrier control words such as `START`, `STOP`, and `HELP` are protocol traffic and should not be treated as agent instructions.
 
 **Outbound SMS limits and gates (current):**
 
@@ -801,7 +801,7 @@ Before placing a call, confirm the destination number and websocket URL with the
 
 All text commands are identity-scoped and require `-i <handle>`.
 
-In Hermes-routed Inkbox sessions, inbound human SMS fragments are buffered per contact before the agent is prompted. Multi-message bursts are delivered as one prompt with an `[inkbox:sms_burst ...]` marker and relative fragment timestamps. Slash commands such as `/approve` and `/deny` bypass that marker so Hermes sees command text rather than tagged SMS body text; carrier control words such as `START`, `STOP`, and `HELP` are protocol traffic and should not be treated as agent instructions.
+In Hermes-routed Inkbox sessions, inbound human SMS fragments are buffered per contact before the agent is prompted. Multi-message bursts are delivered as one prompt with an `[inkbox:sms_burst ...]` marker and relative fragment timestamps. If SMS arrives while an agent run is already active for that contact, Hermes queues it for the next turn and merges later SMS follow-ups into the same pending prompt instead of interrupting the active run. Slash commands such as `/approve` and `/deny` bypass that marker so Hermes sees command text rather than tagged SMS body text; carrier control words such as `START`, `STOP`, and `HELP` are protocol traffic and should not be treated as agent instructions.
 
 **Outbound SMS limits and gates (current):**
 
