@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from collections import OrderedDict
@@ -343,6 +344,52 @@ async def test_live_inkbox_sms_continue_is_coerced_to_hold(caplog):
     assert "Need help" not in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_queued_inkbox_sms_continue_is_coerced_to_hold():
+    source = _inkbox_sms_source("contact-1", "+15555550101")
+    config = GatewayConfig(
+        pre_agent_hook=_hook_config(platform="inkbox", channel="sms")
+    )
+    runner = _runner(config=config, source=source)
+    runner._run_pre_agent_hook = AsyncMock(
+        return_value={
+            "ok": True,
+            "action": "continue",
+            "hydration": {"prompt_context": "context that must not be sent live"},
+            "outbound": {"mode": "hold_no_reply"},
+        }
+    )
+    event = _event(
+        "[inkbox:sms from=+15555550101 | contact_id=contact-1]\nNeed help",
+        source=source,
+        raw_message=_inkbox_raw("sms-queued", "+15555550101", "Need help"),
+        message_id="sms-queued",
+    )
+
+    action, _context, exact = await runner._apply_pre_agent_hook_for_turn(
+        event=event,
+        source=source,
+        session_entry=_session_entry(source),
+        session_key=build_session_key(source),
+        context_prompt="base",
+    )
+
+    assert action == "hold"
+    assert exact is None
+    runner._run_pre_agent_hook.assert_awaited_once()
+
+
+def test_queued_followup_drain_uses_pre_agent_hook_gate():
+    from gateway.run import GatewayRunner
+
+    source_text = inspect.getsource(GatewayRunner._run_agent)
+    gate = "hook_action, context_prompt, exact_reply = await self._apply_pre_agent_hook_for_turn"
+    recursive_run = "followup_result = await self._run_agent"
+
+    assert gate in source_text
+    assert source_text.index(gate) < source_text.index(recursive_run)
+
+
 def test_live_inkbox_sms_generate_draft_is_coerced_to_hold():
     source = _inkbox_sms_source("contact-1", "+15555550101")
     runner = _runner(source=source)
@@ -370,6 +417,30 @@ def test_live_inkbox_sms_generate_draft_is_coerced_to_hold():
 
     assert action == "hold"
     assert exact is None
+
+
+@pytest.mark.asyncio
+async def test_auto_reset_flags_are_persisted_before_hook_hold():
+    source = _source()
+    session_entry = _session_entry(source)
+    session_entry.was_auto_reset = True
+    session_entry.auto_reset_reason = "idle"
+    config = GatewayConfig(pre_agent_hook=_hook_config())
+    runner = _runner(config=config, source=source, session_entry=session_entry)
+    runner._run_pre_agent_hook = AsyncMock(
+        return_value={"ok": True, "action": "hold", "outbound": {"mode": "hold_no_reply"}}
+    )
+    runner._run_agent = AsyncMock(side_effect=AssertionError("agent should not run"))
+
+    result = await runner._handle_message_with_agent(
+        _event(source=source), source, _quick_key="q", run_generation=1
+    )
+
+    assert result is None
+    assert session_entry.was_auto_reset is False
+    assert session_entry.auto_reset_reason is None
+    runner.session_store._save.assert_called()
+    runner._run_agent.assert_not_called()
 
 
 @pytest.mark.asyncio

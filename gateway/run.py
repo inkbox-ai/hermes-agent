@@ -41,6 +41,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -7673,6 +7674,53 @@ class GatewayRunner:
         )
         return "hold", context_prompt, None
 
+    async def _apply_pre_agent_hook_for_turn(
+        self,
+        *,
+        event: MessageEvent,
+        source,
+        session_entry,
+        session_key: str,
+        context_prompt: str,
+        was_auto_reset: bool = False,
+        auto_reset_reason: Optional[str] = None,
+    ) -> tuple[str, str, Optional[str]]:
+        """Run the configured pre-agent hook for one inbound turn.
+
+        Used by both first-class inbound messages and queued follow-ups so the
+        hook remains a true pre-agent gate for every user turn.
+        """
+        if not self._pre_agent_hook_enabled(source, event):
+            return "continue", context_prompt, None
+        try:
+            pre_agent_payload = self._build_pre_agent_hook_payload(
+                event=event,
+                source=source,
+                session_entry=session_entry,
+                session_key=session_key,
+                was_auto_reset=was_auto_reset,
+                auto_reset_reason=auto_reset_reason,
+            )
+            pre_agent_result = await self._run_pre_agent_hook(pre_agent_payload)
+            return self._apply_pre_agent_hook_result(
+                pre_agent_result,
+                context_prompt=context_prompt,
+                source=source,
+                event=event,
+                session_key=session_key,
+            )
+        except Exception as exc:
+            logger.warning(
+                "pre_agent_hook failed closed: internal_error=%s "
+                "platform=%s channel=%s session_key=%s message_id=%s",
+                type(exc).__name__,
+                self._pre_agent_hook_platform_value(source),
+                self._pre_agent_hook_channel(event),
+                session_key,
+                getattr(event, "message_id", None),
+            )
+            return "hold", context_prompt, None
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -7740,8 +7788,10 @@ class GatewayRunner:
         )
         # Consume the is_fresh_reset flag immediately so it doesn't leak
         # onto subsequent messages in the same session (issue #6508).
+        _session_boundary_flags_consumed = False
         if getattr(session_entry, "is_fresh_reset", False):
             session_entry.is_fresh_reset = False
+            _session_boundary_flags_consumed = True
         if _is_new_session:
             await self.hooks.emit("session:start", {
                 "platform": source.platform.value if source.platform else "",
@@ -7830,42 +7880,29 @@ class GatewayRunner:
 
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
+            _session_boundary_flags_consumed = True
 
-        if self._pre_agent_hook_enabled(source, event):
+        if _session_boundary_flags_consumed:
             try:
-                pre_agent_payload = self._build_pre_agent_hook_payload(
-                    event=event,
-                    source=source,
-                    session_entry=session_entry,
-                    session_key=session_key,
-                    was_auto_reset=_pre_hook_was_auto_reset,
-                    auto_reset_reason=_pre_hook_auto_reset_reason,
-                )
-                pre_agent_result = await self._run_pre_agent_hook(pre_agent_payload)
-                hook_action, context_prompt, exact_reply = self._apply_pre_agent_hook_result(
-                    pre_agent_result,
-                    context_prompt=context_prompt,
-                    source=source,
-                    event=event,
-                    session_key=session_key,
-                )
+                self.session_store._save()
             except Exception as exc:
-                logger.warning(
-                    "pre_agent_hook failed closed: internal_error=%s "
-                    "platform=%s channel=%s session_key=%s message_id=%s",
-                    type(exc).__name__,
-                    self._pre_agent_hook_platform_value(source),
-                    self._pre_agent_hook_channel(event),
-                    session_key,
-                    getattr(event, "message_id", None),
-                )
-                hook_action, exact_reply = "hold", None
-            if hook_action == "hold":
-                self._clear_session_env(_session_env_tokens)
-                return None
-            if hook_action == "reply":
-                self._clear_session_env(_session_env_tokens)
-                return exact_reply
+                logger.debug("Failed to persist consumed session flags: %s", exc)
+
+        hook_action, context_prompt, exact_reply = await self._apply_pre_agent_hook_for_turn(
+            event=event,
+            source=source,
+            session_entry=session_entry,
+            session_key=session_key,
+            context_prompt=context_prompt,
+            was_auto_reset=_pre_hook_was_auto_reset,
+            auto_reset_reason=_pre_hook_auto_reset_reason,
+        )
+        if hook_action == "hold":
+            self._clear_session_env(_session_env_tokens)
+            return None
+        if hook_action == "reply":
+            self._clear_session_env(_session_env_tokens)
+            return exact_reply
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
@@ -17106,6 +17143,58 @@ class GatewayRunner:
                             session_key or "?",
                         )
                         return result
+                hook_event = pending_event or MessageEvent(
+                    text=pending or "",
+                    message_type=MessageType.TEXT,
+                    source=next_source,
+                    message_id=None,
+                )
+                try:
+                    self.session_store._ensure_loaded()
+                    hook_session_entry = self.session_store._entries.get(session_key)
+                except Exception:
+                    hook_session_entry = None
+                if hook_session_entry is None:
+                    hook_session_entry = SimpleNamespace(
+                        session_id=session_id,
+                        created_at=None,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                hook_action, context_prompt, exact_reply = await self._apply_pre_agent_hook_for_turn(
+                    event=hook_event,
+                    source=next_source,
+                    session_entry=hook_session_entry,
+                    session_key=session_key,
+                    context_prompt=context_prompt,
+                    was_auto_reset=False,
+                    auto_reset_reason=None,
+                )
+                if hook_action in {"hold", "reply"}:
+                    if hook_action == "reply" and exact_reply:
+                        reply_adapter = self.adapters.get(next_source.platform) or adapter
+                        if reply_adapter:
+                            await reply_adapter._send_with_retry(
+                                chat_id=next_source.chat_id,
+                                content=exact_reply,
+                                reply_to=(
+                                    self._reply_anchor_for_event(hook_event)
+                                    if pending_event is not None
+                                    else None
+                                ),
+                                metadata=self._thread_metadata_for_source(
+                                    next_source,
+                                    (
+                                        self._reply_anchor_for_event(hook_event)
+                                        if pending_event is not None
+                                        else None
+                                    ),
+                                ),
+                            )
+                    consumed_result = dict(result or {})
+                    consumed_result["final_response"] = ""
+                    consumed_result["already_sent"] = True
+                    return consumed_result
+                if pending_event is not None:
                     next_message = await self._prepare_inbound_message_text(
                         event=pending_event,
                         source=next_source,
