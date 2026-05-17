@@ -1,12 +1,12 @@
 ---
 sidebar_position: 1
 title: "Messaging Gateway"
-description: "Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Matrix, DingTalk, Yuanbao, Microsoft Teams, LINE, Webhooks, or any OpenAI-compatible frontend via the API server — architecture and setup overview"
+description: "Chat with Hermes from Inkbox, Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Matrix, DingTalk, Yuanbao, Microsoft Teams, LINE, Webhooks, or any OpenAI-compatible frontend via the API server — architecture and setup overview"
 ---
 
 # Messaging Gateway
 
-Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Matrix, DingTalk, Feishu/Lark, WeCom, Weixin, BlueBubbles (iMessage), QQ, Yuanbao, Microsoft Teams, LINE, or your browser. The gateway is a single background process that connects to all your configured platforms, handles sessions, runs cron jobs, and delivers voice messages.
+Chat with Hermes from Inkbox, Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Matrix, DingTalk, Feishu/Lark, WeCom, Weixin, BlueBubbles (iMessage), QQ, Yuanbao, Microsoft Teams, LINE, or your browser. The gateway is a single background process that connects to all your configured platforms, handles sessions, runs cron jobs, and delivers voice messages.
 
 For the full voice feature set — including CLI microphone mode, spoken replies in messaging, and Discord voice-channel conversations — see [Voice Mode](/docs/user-guide/features/voice-mode) and [Use Voice Mode with Hermes](/docs/guides/use-voice-mode-with-hermes).
 
@@ -14,6 +14,7 @@ For the full voice feature set — including CLI microphone mode, spoken replies
 
 | Platform | Voice | Images | Files | Threads | Reactions | Typing | Streaming |
 |----------|:-----:|:------:|:-----:|:-------:|:---------:|:------:|:---------:|
+| Inkbox | ✅ | ✅ | ✅ | ✅ | — | — | ✅ |
 | Telegram | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ |
 | Discord | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Slack | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -45,6 +46,7 @@ flowchart TB
     subgraph Gateway["Hermes Gateway"]
         subgraph Adapters["Platform adapters"]
             tg[Telegram]
+            ib[Inkbox]
             dc[Discord]
             wa[WhatsApp]
             sl[Slack]
@@ -73,6 +75,7 @@ flowchart TB
         cron["Cron scheduler<br/>ticks every 60s"]
     end
 
+    ib --> store
     tg --> store
     dc --> store
     wa --> store
@@ -411,6 +414,7 @@ Each platform has its own toolset:
 | Platform | Toolset | Capabilities |
 |----------|---------|--------------|
 | CLI | `hermes-cli` | Full access |
+| Inkbox | `hermes-inkbox` | Full tools including terminal |
 | Telegram | `hermes-telegram` | Full tools including terminal |
 | Discord | `hermes-discord` | Full tools including terminal |
 | WhatsApp | `hermes-whatsapp` | Full tools including terminal |
@@ -437,6 +441,7 @@ Each platform has its own toolset:
 ## Next Steps
 
 - [Telegram Setup](telegram.md)
+- [Inkbox Setup](inkbox.md)
 - [Discord Setup](discord.md)
 - [Slack Setup](slack.md)
 - [Google Chat Setup](google_chat.md)

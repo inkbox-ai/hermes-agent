@@ -50,6 +50,9 @@ def _patch_sdk(monkeypatch, *, lookup_result=None):
     InkboxClass.return_value.__exit__ = MagicMock(return_value=False)
 
     monkeypatch.setattr(inkbox_mod, "Inkbox", InkboxClass, raising=False)
+    monkeypatch.setattr(
+        inkbox_mod, "verify_webhook", MagicMock(return_value=True), raising=False,
+    )
     monkeypatch.setattr(inkbox_mod, "INKBOX_AVAILABLE", True, raising=False)
     return fake_client
 
@@ -186,7 +189,8 @@ class TestWebhookRouting:
 
         assert len(captured) == 1
         ev = captured[0]
-        assert ev.text == "Hello world"
+        assert ev.text.endswith("\nHello world")
+        assert ev.text.startswith("[inkbox:email")
         assert ev.source.platform == Platform.INKBOX
         # contact_id resolved via lookup() should win over the raw email.
         assert ev.source.chat_id == "contact-uuid-123"
@@ -225,7 +229,8 @@ class TestWebhookRouting:
 
         assert len(captured) == 1
         ev = captured[0]
-        assert ev.text == "ping"
+        assert ev.text.endswith("\nping")
+        assert ev.text.startswith("[inkbox:sms")
         assert ev.source.chat_id == "contact-uuid-123"
         # SMS does NOT mint a sub-session — same chat_id, no thread_id.
         assert ev.source.thread_id is None
@@ -284,6 +289,59 @@ class TestWebhookRouting:
             await task
 
         assert len(captured) == 1
+
+    @pytest.mark.asyncio
+    async def test_duplicate_text_id_is_ignored_without_request_id(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        captured = []
+
+        async def fake_handle_message(event):
+            captured.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+        envelope = {
+            "event_type": "text.received",
+            "data": {"text_message": {
+                "id": "sms-same-id",
+                "remote_phone_number": "+15555550101",
+                "local_phone_number": "+18005550100",
+                "text": "ping",
+                "direction": "inbound",
+            }},
+        }
+        body = json.dumps(envelope).encode()
+        await adapter._handle_webhook(_FakeRequest(body))
+        await adapter._handle_webhook(_FakeRequest(body))
+
+        for task in list(adapter._background_tasks):
+            await task
+
+        assert len(captured) == 1
+
+    @pytest.mark.asyncio
+    async def test_text_lifecycle_event_does_not_enqueue_agent_turn(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        captured = []
+
+        async def fake_handle_message(event):
+            captured.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+        envelope = {
+            "event_type": "text.delivered",
+            "data": {"text_message": {
+                "id": "sms-queued-1",
+                "remote_phone_number": "+15555550101",
+                "direction": "outbound",
+                "delivery_status": "delivered",
+            }},
+        }
+        resp = await adapter._handle_webhook(_FakeRequest(json.dumps(envelope).encode()))
+
+        assert resp.status == 200
+        assert captured == []
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +458,59 @@ class TestSend:
         assert result.success is True
         identity = adapter._inkbox.get_identity.return_value
         identity.send_text.assert_called_once_with(to="+15555550101", text="hello")
+        assert result.raw_response["mode"] == "sms"
+
+    @pytest.mark.asyncio
+    async def test_send_sms_structures_provider_error(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        identity = adapter._inkbox.get_identity.return_value
+
+        class FakeInkboxAPIError(Exception):
+            status_code = 409
+            detail = {
+                "detail": {
+                    "error": "messaging_profile_disabled",
+                    "message": "Messaging profile is disabled.",
+                },
+            }
+
+        identity.send_text.side_effect = FakeInkboxAPIError("conflict")
+
+        result = await adapter.send(
+            "+15555550101",
+            "hello",
+            metadata={"mode": "sms", "to_phone": "+15555550101"},
+        )
+
+        assert result.success is False
+        assert result.retryable is False
+        assert result.fallback_allowed is False
+        assert "messaging_profile_disabled" in (result.error or "")
+        assert result.raw_response["status_code"] == 409
+        assert result.raw_response["error_code"] == "messaging_profile_disabled"
+        assert result.raw_response["category"] == "sender_provisioning"
+
+    @pytest.mark.asyncio
+    async def test_send_sms_marks_server_error_retryable(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        identity = adapter._inkbox.get_identity.return_value
+
+        class FakeInkboxAPIError(Exception):
+            status_code = 503
+            detail = {"detail": {"error": "provider_unavailable", "message": "try later"}}
+
+        identity.send_text.side_effect = FakeInkboxAPIError("unavailable")
+
+        result = await adapter.send(
+            "+15555550101",
+            "hello",
+            metadata={"mode": "sms", "to_phone": "+15555550101"},
+        )
+
+        assert result.success is False
+        assert result.retryable is True
+        assert result.fallback_allowed is False
+        assert result.raw_response["category"] == "transient"
 
     @pytest.mark.asyncio
     async def test_send_email_resolves_address_from_contact_when_chat_id_is_uuid(self, monkeypatch):

@@ -282,3 +282,21 @@ class TestSendWithRetryFallback:
             result = await adapter._send_with_retry("chat1", "hello", max_retries=2)
         assert not result.success
         assert len(adapter._send_calls) == 2  # original + fallback only
+
+    @pytest.mark.asyncio
+    async def test_non_network_error_can_disable_plain_text_fallback(self):
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(
+                success=False,
+                error="provider provisioning disabled",
+                fallback_allowed=False,
+            ),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry(
+                "chat1", "**bold**", max_retries=2, base_delay=0,
+            )
+        mock_sleep.assert_not_called()
+        assert not result.success
+        assert len(adapter._send_calls) == 1

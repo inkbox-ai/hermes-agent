@@ -264,6 +264,7 @@ When the callee picks up, audio bridges to the *same* WS handler as inbound call
 - Allowed only from **local** numbers, not toll-free.
 - **15 outbound sends per phone number per rolling 24h.**
 - New local numbers need **~10-15 min** for 10DLC carrier propagation. `identity.phone_number.sms_status` is `SmsStatus.PENDING` until ready; sends in this window return `409 sender_sms_pending`.
+- `409 messaging_profile_disabled` means the sender's carrier messaging profile is disabled upstream/provider-side. Treat it as a non-retryable provisioning issue; changing text content or retrying immediately will not fix it.
 - Recipient must have texted **`START`** to any number in the org. Unknown → `403 recipient_not_opted_in`. `STOP` → `403 recipient_opted_out`.
 
 **Coming soon:** toll-free SMS sending, customer-managed 10DLC brands/campaigns (drastically higher per-number limits).
@@ -803,6 +804,7 @@ All text commands are identity-scoped and require `-i <handle>`.
 - Allowed only from **local** numbers, not toll-free.
 - **15 sends per phone number per rolling 24h.**
 - A freshly provisioned local number needs **~10-15 min** for 10DLC carrier propagation. Inspect with `inkbox number get <id>`; sending is gated until `smsStatus` reads `ready` (otherwise `409 sender_sms_pending`).
+- `409 messaging_profile_disabled` is a sender provisioning/provider state problem. Do not immediate-retry or vary the message body; inspect the number/provisioning state and escalate to Inkbox/provider operations.
 - Recipient must have texted **`START`** to any number in the org. Unknown → `403 recipient_not_opted_in`. `STOP` → `403 recipient_opted_out`.
 
 **Coming soon:** toll-free SMS sending, customer-managed 10DLC brands/campaigns (drastically higher per-number limits).

@@ -106,6 +106,7 @@ except ImportError:
 
 from gateway.config import INKBOX_BASE_URL_DEFAULT, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.helpers import redact_phone
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,30 @@ DEFAULT_WS_PATH = "/phone/media/ws"
 CONTACT_CACHE_TTL_SECONDS = 300
 WEBHOOK_DEDUP_TTL_SECONDS = 300
 SMS_MAX_LENGTH = 1600  # Inkbox SMS hard cap
+
+SMS_SENDER_PROVISIONING_ERROR_CODES = frozenset({
+    "messaging_profile_disabled",
+    "sender_sms_pending",
+    "sender_sms_disabled",
+    "sender_sms_not_ready",
+    "sender_sms_unavailable",
+})
+SMS_CONSENT_ERROR_CODES = frozenset({
+    "recipient_not_opted_in",
+    "recipient_opted_out",
+    "recipient_blocked",
+})
+SMS_RATE_LIMIT_ERROR_CODES = frozenset({
+    "rate_limited",
+    "daily_send_limit_exceeded",
+    "sms_send_limit_exceeded",
+})
+SMS_TRANSIENT_ERROR_CODES = frozenset({
+    "temporary_unavailable",
+    "provider_unavailable",
+    "upstream_unavailable",
+    "timeout",
+})
 
 # Hermes emits a few classes of admin/system notice via adapter.send() —
 # session-reset banners ("◐ ..."), runtime info blocks ("◆ Model: ..."),
@@ -180,6 +205,152 @@ def _is_hermes_admin_notice(content: str) -> bool:
     if head.startswith(_ADMIN_NOTICE_PREFIXES):
         return True
     return any(s in head for s in _ADMIN_NOTICE_SUBSTRINGS)
+
+
+def _plain_value(value: Any) -> Optional[str]:
+    """Return enum-like values as strings without leaking object repr noise."""
+    if value is None:
+        return None
+    raw = getattr(value, "value", value)
+    text = str(raw).strip()
+    return text or None
+
+
+def _json_safe_detail(value: Any) -> Any:
+    """Keep structured provider error details if they are JSON-safe."""
+    if isinstance(value, (dict, list, str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _sms_error_body(detail: Any) -> Dict[str, Any]:
+    """Normalize Inkbox API error payloads to the innermost detail dict."""
+    if not isinstance(detail, dict):
+        return {}
+    nested = detail.get("detail")
+    if isinstance(nested, dict):
+        return nested
+    return detail
+
+
+def _classify_sms_error(
+    status_code: Optional[int],
+    error_code: Optional[str],
+    message: str,
+) -> Tuple[str, bool]:
+    """Return ``(category, retryable)`` for an Inkbox SMS send failure."""
+    code = (error_code or "").lower().strip()
+    lower_msg = (message or "").lower()
+
+    if code in SMS_TRANSIENT_ERROR_CODES:
+        return ("transient", True)
+    if code in SMS_SENDER_PROVISIONING_ERROR_CODES:
+        return ("sender_provisioning", False)
+    if code in SMS_CONSENT_ERROR_CODES:
+        return ("recipient_consent", False)
+    if code in SMS_RATE_LIMIT_ERROR_CODES:
+        return ("rate_limit", False)
+
+    if status_code in {408, 500, 502, 503, 504}:
+        return ("transient", True)
+    if status_code == 429:
+        return ("rate_limit", False)
+    if status_code == 409:
+        return ("conflict", False)
+    if status_code is not None and 400 <= status_code < 500:
+        return ("permanent", False)
+
+    if any(marker in lower_msg for marker in ("timeout", "temporar", "connection")):
+        return ("transient", True)
+    return ("sdk_error", False)
+
+
+def _extract_inkbox_sms_error(exc: Exception) -> Dict[str, Any]:
+    """Extract structured fields from SDK exceptions without depending on SDK types."""
+    status_code = getattr(exc, "status_code", None)
+    detail = getattr(exc, "detail", None)
+    response = getattr(exc, "response", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+
+    body = _sms_error_body(detail)
+    error_code = _plain_value(
+        body.get("error")
+        or body.get("code")
+        or getattr(exc, "code", None)
+    )
+    message = _plain_value(body.get("message"))
+    if not message:
+        nested = body.get("detail")
+        message = nested if isinstance(nested, str) else None
+    if not message:
+        message = str(exc) or exc.__class__.__name__
+
+    category, retryable = _classify_sms_error(status_code, error_code, message)
+    return {
+        "status_code": status_code,
+        "error_code": error_code,
+        "message": message,
+        "detail": _json_safe_detail(detail),
+        "category": category,
+        "retryable": retryable,
+    }
+
+
+def _format_inkbox_sms_error(fields: Dict[str, Any]) -> str:
+    status = fields.get("status_code")
+    code = fields.get("error_code")
+    message = fields.get("message") or "send_text failed"
+    prefix = "Inkbox SMS send failed"
+    if status:
+        prefix += f" (HTTP {status})"
+    if code:
+        prefix += f" [{code}]"
+    return f"{prefix}: {message}"
+
+
+def _sms_send_failure(exc: Exception, *, to_number: str) -> SendResult:
+    fields = _extract_inkbox_sms_error(exc)
+    logger.error(
+        "[Inkbox] SMS send failed to %s: status=%s code=%s category=%s retryable=%s message=%s",
+        redact_phone(to_number),
+        fields.get("status_code"),
+        fields.get("error_code"),
+        fields.get("category"),
+        fields.get("retryable"),
+        fields.get("message"),
+    )
+    return SendResult(
+        success=False,
+        error=_format_inkbox_sms_error(fields),
+        raw_response={"platform": "inkbox", "mode": "sms", **fields},
+        retryable=bool(fields.get("retryable")),
+        fallback_allowed=False,
+    )
+
+
+def _sms_send_failure_dict(exc: Exception) -> Dict[str, Any]:
+    fields = _extract_inkbox_sms_error(exc)
+    return {
+        "success": False,
+        "platform": "inkbox",
+        "mode": "sms",
+        "error": _format_inkbox_sms_error(fields),
+        **fields,
+    }
+
+
+def _text_message_metadata(message: Any, *, mode: str) -> Dict[str, Any]:
+    """Small, non-body metadata payload for SendResult.raw_response."""
+    return {
+        "platform": "inkbox",
+        "mode": mode,
+        "message_id": _plain_value(getattr(message, "id", None)),
+        "delivery_status": _plain_value(getattr(message, "delivery_status", None)),
+        "status": _plain_value(getattr(message, "status", None)),
+        "direction": _plain_value(getattr(message, "direction", None)),
+        "type": _plain_value(getattr(message, "type", None)),
+    }
 
 
 def _inkbox_tunnel_state_dir() -> "Path":
@@ -794,9 +965,20 @@ class InkboxAdapter(BasePlatformAdapter):
                 msg = await asyncio.to_thread(
                     identity.send_text, to=to_number, text=content[:SMS_MAX_LENGTH],
                 )
-                return SendResult(success=True, message_id=str(getattr(msg, "id", "")))
+                raw_response = _text_message_metadata(msg, mode="sms")
+                logger.info(
+                    "[Inkbox] SMS queued to %s: id=%s delivery_status=%s",
+                    redact_phone(to_number),
+                    raw_response.get("message_id") or "",
+                    raw_response.get("delivery_status") or raw_response.get("status") or "",
+                )
+                return SendResult(
+                    success=True,
+                    message_id=str(getattr(msg, "id", "")),
+                    raw_response=raw_response,
+                )
             except Exception as exc:
-                return SendResult(success=False, error=f"send_text failed: {exc}")
+                return _sms_send_failure(exc, to_number=to_number)
 
         if mode == "email":
             to_addr = (meta.get("to_email") or "").strip()
@@ -950,6 +1132,8 @@ class InkboxAdapter(BasePlatformAdapter):
             return web.Response(status=200, text="ok")
         if event_type == "text.received":
             return await self._on_text_received(envelope)
+        if event_type and event_type.startswith("text."):
+            return await self._on_text_lifecycle(envelope)
         if "phone_number_id" in envelope and "remote_phone_number" in envelope:
             return await self._on_incoming_call(envelope)
         return web.Response(status=200, text="ignored")
@@ -1034,6 +1218,12 @@ class InkboxAdapter(BasePlatformAdapter):
 
     async def _on_text_received(self, envelope: Dict[str, Any]) -> "web.Response":
         text_msg = (envelope.get("data") or {}).get("text_message") or {}
+        text_id = str(text_msg.get("id") or "").strip()
+        if text_id and self._is_duplicate(f"text:{text_id}"):
+            return web.Response(status=200, text="duplicate")
+        direction = str(text_msg.get("direction") or "").strip().lower()
+        if direction and direction != "inbound":
+            return web.Response(status=200, text="ok")
         remote = (text_msg.get("remote_phone_number") or "").strip()
         if not remote:
             return web.Response(status=200, text="ok")
@@ -1059,10 +1249,34 @@ class InkboxAdapter(BasePlatformAdapter):
             message_type=MessageType.TEXT,
             source=source,
             raw_message=envelope,
-            message_id=str(text_msg.get("id") or ""),
+            message_id=text_id,
             auto_skill="inkbox",
         )
         await self._enqueue(event)
+        return web.Response(status=200, text="ok")
+
+    async def _on_text_lifecycle(self, envelope: Dict[str, Any]) -> "web.Response":
+        """Log SMS delivery/status callbacks without enqueueing an agent turn."""
+        event_type = str(envelope.get("event_type") or "")
+        text_msg = (envelope.get("data") or {}).get("text_message") or {}
+        text_id = str(text_msg.get("id") or "").strip()
+        direction = str(text_msg.get("direction") or "").strip()
+        remote = str(text_msg.get("remote_phone_number") or "").strip()
+        status = (
+            _plain_value(text_msg.get("delivery_status"))
+            or _plain_value(text_msg.get("status"))
+            or ""
+        )
+        error_code = _plain_value(text_msg.get("error") or text_msg.get("error_code"))
+        logger.info(
+            "[Inkbox] Text lifecycle event=%s id=%s direction=%s status=%s remote=%s error=%s",
+            event_type,
+            text_id,
+            direction,
+            status,
+            redact_phone(remote),
+            error_code or "",
+        )
         return web.Response(status=200, text="ok")
 
     async def _on_incoming_call(self, envelope: Dict[str, Any]) -> "web.Response":
@@ -1661,13 +1875,23 @@ async def send_inkbox_direct(
                     target = getattr(chosen, "value", None) if chosen else None
                 if not target:
                     return {"error": f"No phone for contact {chat_id}"}
-                msg = identity.send_text(to=target, text=message[:SMS_MAX_LENGTH])
+                try:
+                    msg = identity.send_text(to=target, text=message[:SMS_MAX_LENGTH])
+                except Exception as exc:
+                    logger.error(
+                        "[Inkbox] Direct SMS send failed to %s",
+                        redact_phone(str(target)),
+                    )
+                    return _sms_send_failure_dict(exc)
                 return {
                     "success": True,
                     "platform": "inkbox",
                     "chat_id": chat_id,
                     "message_id": str(getattr(msg, "id", "")),
                     "mode": "sms",
+                    "delivery_status": _plain_value(
+                        getattr(msg, "delivery_status", None),
+                    ),
                 }
 
             if chosen_mode == "email":
