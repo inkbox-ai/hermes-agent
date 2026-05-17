@@ -64,7 +64,7 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
-_INKBOX_SMS_HELP_TEXT = (
+_INKBOX_SMS_HELP_TEXT_DEFAULT = (
     "I can help route local vendor requests over SMS.\n"
     "Text what you need, your location, and any timing/urgency. "
     "Short follow-ups are fine; I wait a moment before replying.\n"
@@ -9158,6 +9158,18 @@ class GatewayRunner:
         user_id_alt = str(getattr(source, "user_id_alt", "") or "")
         return user_id_alt.startswith("+")
 
+    def _inkbox_sms_help_text(self) -> str:
+        """Return deployment-specific end-user help text for Inkbox SMS."""
+        text: Optional[Any] = None
+        platform_cfg = self.config.platforms.get(Platform.INKBOX)
+        extra = getattr(platform_cfg, "extra", {}) if platform_cfg else {}
+        if isinstance(extra, dict):
+            text = extra.get("sms_help_text")
+        if text is None:
+            text = os.getenv("INKBOX_SMS_HELP_TEXT")
+        rendered = str(text).strip() if text is not None else ""
+        return rendered or _INKBOX_SMS_HELP_TEXT_DEFAULT
+
     async def _handle_inkbox_sms_user_command(
         self,
         event: MessageEvent,
@@ -9174,7 +9186,7 @@ class GatewayRunner:
         command = (canonical_command or typed_command or "").strip().lower()
         typed = (typed_command or command).strip().lower()
         if command in {"help", "commands"}:
-            return _INKBOX_SMS_HELP_TEXT
+            return self._inkbox_sms_help_text()
         if command == "status":
             if active_session_key:
                 return "I'm working on your last message. Send /stop to cancel or /reset to start over."
@@ -9203,15 +9215,12 @@ class GatewayRunner:
             "Blocked Inkbox SMS end-user command /%s from general Hermes command surface",
             typed,
         )
-        return (
-            "That command is for operators. For SMS, use /help, /reset, "
-            "/status, or /stop. Otherwise, text your request normally."
-        )
+        return "I don't know that command. Try /help."
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
         if self._is_inkbox_sms_event(event):
-            return _INKBOX_SMS_HELP_TEXT
+            return self._inkbox_sms_help_text()
         from hermes_cli.commands import gateway_help_lines
         lines = [
             t("gateway.help.header"),
@@ -9238,7 +9247,7 @@ class GatewayRunner:
     async def _handle_commands_command(self, event: MessageEvent) -> str:
         """Handle /commands [page] - paginated list of all commands and skills."""
         if self._is_inkbox_sms_event(event):
-            return _INKBOX_SMS_HELP_TEXT
+            return self._inkbox_sms_help_text()
         from hermes_cli.commands import gateway_help_lines
 
         raw_args = event.get_command_args().strip()

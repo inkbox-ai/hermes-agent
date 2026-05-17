@@ -795,11 +795,17 @@ class TestInkboxAuthorization:
 
 
 class TestInkboxSmsCommandSurface:
-    def _runner(self):
+    def _runner(self, *, sms_help_text=None):
         from gateway.config import GatewayConfig
         from gateway.run import GatewayRunner
 
-        runner = GatewayRunner(GatewayConfig())
+        config = GatewayConfig()
+        if sms_help_text is not None:
+            config.platforms[Platform.INKBOX] = PlatformConfig(
+                enabled=True,
+                extra={"sms_help_text": sms_help_text},
+            )
+        runner = GatewayRunner(config)
         runner.pairing_store = MagicMock()
         runner.pairing_store.is_approved = MagicMock(return_value=False)
         return runner
@@ -835,6 +841,14 @@ class TestInkboxSmsCommandSurface:
         assert "/approve" not in result
 
     @pytest.mark.asyncio
+    async def test_sms_help_text_can_be_configured(self):
+        result = await self._runner(
+            sms_help_text="Custom SMS help. Text your request normally.",
+        )._handle_help_command(self._sms_event("/help"))
+
+        assert result == "Custom SMS help. Text your request normally."
+
+    @pytest.mark.asyncio
     async def test_sms_commands_uses_same_compact_surface(self):
         result = await self._runner()._handle_commands_command(self._sms_event("/commands"))
 
@@ -850,7 +864,8 @@ class TestInkboxSmsCommandSurface:
             typed_command="debug",
         )
 
-        assert "for operators" in result
+        assert result == "I don't know that command. Try /help."
+        assert "operator" not in result
         assert "/help" in result
         assert "debug report" not in result
 
