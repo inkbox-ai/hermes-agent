@@ -2557,11 +2557,44 @@ class GatewayRunner:
             if agent is not _AGENT_PENDING_SENTINEL
         }
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    @staticmethod
+    def _adapter_busy_followup_policy(adapter: Any, event: MessageEvent) -> Dict[str, Any]:
+        if adapter is None:
+            return {}
+        policy_fn = getattr(type(adapter), "busy_followup_policy", None)
+        if policy_fn is None:
+            return {}
+        try:
+            policy = policy_fn(adapter, event)
+        except Exception as exc:
+            logger.warning("Adapter busy-followup policy failed: %s", exc)
+            return {}
+        if not isinstance(policy, dict):
+            return {}
+        mode = str(policy.get("mode") or "").strip().lower()
+        if mode not in {"interrupt", "queue", "steer"}:
+            mode = ""
+        return {
+            "mode": mode,
+            "merge_text": bool(policy.get("merge_text")),
+        }
+
+    def _queue_or_replace_pending_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        merge_text: bool = False,
+    ) -> None:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return
-        merge_pending_message_event(adapter._pending_messages, session_key, event)
+        merge_pending_message_event(
+            adapter._pending_messages,
+            session_key,
+            event,
+            merge_text=merge_text,
+        )
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
@@ -2585,11 +2618,16 @@ class GatewayRunner:
             adapter = self.adapters.get(event.source.platform)
             if not adapter:
                 return True
+            policy = self._adapter_busy_followup_policy(adapter, event)
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled():
-                self._queue_or_replace_pending_event(session_key, event)
+                self._queue_or_replace_pending_event(
+                    session_key,
+                    event,
+                    merge_text=bool(policy.get("merge_text")),
+                )
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
@@ -2614,12 +2652,15 @@ class GatewayRunner:
             return False  # let default path handle it
 
         running_agent = self._running_agents.get(session_key)
+        policy = self._adapter_busy_followup_policy(adapter, event)
+        policy_mode = policy.get("mode") or ""
+        merge_text = bool(policy.get("merge_text"))
 
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet
         # (sentinel) or lacks steer(), or the payload is empty, fall back
         # to queue semantics so nothing is lost.
-        effective_mode = self._busy_input_mode
+        effective_mode = policy_mode or self._busy_input_mode
         steered = False
         if effective_mode == "steer":
             steer_text = (event.text or "").strip()
@@ -2644,7 +2685,12 @@ class GatewayRunner:
         # successful steer — the text already landed inside the run and
         # must NOT also be replayed as a next-turn user message.
         if not steered:
-            merge_pending_message_event(adapter._pending_messages, session_key, event)
+            merge_pending_message_event(
+                adapter._pending_messages,
+                session_key,
+                event,
+                merge_text=merge_text,
+            )
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -6331,11 +6377,15 @@ class GatewayRunner:
                     f"mid-turn. Wait for the current response or `/stop` first."
                 )
 
+            _busy_adapter = self.adapters.get(source.platform)
+            _busy_policy = self._adapter_busy_followup_policy(_busy_adapter, event)
+            _busy_merge_text = bool(_busy_policy.get("merge_text"))
+            _effective_busy_mode = _busy_policy.get("mode") or self._busy_input_mode
+
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
-                adapter = self.adapters.get(source.platform)
-                if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                if _busy_adapter:
+                    merge_pending_message_event(_busy_adapter._pending_messages, _quick_key, event)
                 return None
 
             _telegram_followup_grace = float(
@@ -6354,10 +6404,9 @@ class GatewayRunner:
                     time.time() - _started_at,
                     _quick_key,
                 )
-                adapter = self.adapters.get(source.platform)
-                if adapter:
+                if _busy_adapter:
                     merge_pending_message_event(
-                        adapter._pending_messages,
+                        _busy_adapter._pending_messages,
                         _quick_key,
                         event,
                         merge_text=True,
@@ -6374,10 +6423,9 @@ class GatewayRunner:
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
                 # Queue the message so it will be picked up after the
                 # agent starts.
-                adapter = self.adapters.get(source.platform)
-                if adapter:
+                if _busy_adapter:
                     merge_pending_message_event(
-                        adapter._pending_messages,
+                        _busy_adapter._pending_messages,
                         _quick_key,
                         event,
                         merge_text=True,
@@ -6385,17 +6433,25 @@ class GatewayRunner:
                 return None
             if self._draining:
                 if self._queue_during_drain_enabled():
-                    self._queue_or_replace_pending_event(_quick_key, event)
+                    self._queue_or_replace_pending_event(
+                        _quick_key,
+                        event,
+                        merge_text=_busy_merge_text,
+                    )
                 return (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
                     if self._queue_during_drain_enabled()
                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
                 )
-            if self._busy_input_mode == "queue":
+            if _effective_busy_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
+                self._queue_or_replace_pending_event(
+                    _quick_key,
+                    event,
+                    merge_text=_busy_merge_text,
+                )
                 return None
-            if self._busy_input_mode == "steer":
+            if _effective_busy_mode == "steer":
                 # Steer mode: inject text into the running agent mid-run via
                 # agent.steer().  Falls back to queue semantics if the payload
                 # is empty, the agent lacks steer(), or steer() rejects.
@@ -6411,7 +6467,11 @@ class GatewayRunner:
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
+                self._queue_or_replace_pending_event(
+                    _quick_key,
+                    event,
+                    merge_text=_busy_merge_text,
+                )
                 return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
             running_agent.interrupt(event.text)

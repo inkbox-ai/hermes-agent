@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent, MessageType
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +327,34 @@ class TestWebhookRouting:
             await task
 
         assert len(captured) == 1
+
+    def test_sms_busy_followup_policy_queues_and_merges_text(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+
+        sms_event = MessageEvent(
+            text="[inkbox:sms from=+15555550101 | contact=Alex]\nping",
+            message_type=MessageType.TEXT,
+        )
+        burst_event = MessageEvent(
+            text="[inkbox:sms_burst messages=2 first_at=2026-04-27T20:00:00Z last_at=2026-04-27T20:00:08Z from=+15555550101 | contact=Alex]\n[+0s] one\n[+8s] two",
+            message_type=MessageType.TEXT,
+        )
+        command_event = MessageEvent(text="/approve", message_type=MessageType.COMMAND)
+        email_event = MessageEvent(
+            text="[inkbox:email from=alex@example.com]\nhello",
+            message_type=MessageType.TEXT,
+        )
+
+        assert adapter.busy_followup_policy(sms_event) == {
+            "mode": "queue",
+            "merge_text": True,
+        }
+        assert adapter.busy_followup_policy(burst_event) == {
+            "mode": "queue",
+            "merge_text": True,
+        }
+        assert adapter.busy_followup_policy(command_event) is None
+        assert adapter.busy_followup_policy(email_event) is None
 
     @pytest.mark.asyncio
     async def test_sms_batching_is_opt_in_by_default(self, monkeypatch):

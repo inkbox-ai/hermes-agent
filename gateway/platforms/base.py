@@ -1353,6 +1353,15 @@ class BasePlatformAdapter(ABC):
         """
         return False
 
+    def busy_followup_policy(self, event: MessageEvent) -> Optional[Dict[str, Any]]:
+        """Adapter override for messages that arrive while a session is active.
+
+        Return a small policy dict such as ``{"mode": "queue", "merge_text": True}``
+        to override the gateway's global busy-input mode for this event.
+        Default behavior is controlled by the gateway runner.
+        """
+        return None
+
     async def send_draft(
         self,
         chat_id: str,

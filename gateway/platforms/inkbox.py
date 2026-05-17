@@ -1370,6 +1370,14 @@ class InkboxAdapter(BasePlatformAdapter):
             timestamp=timestamp,
         )
 
+    def busy_followup_policy(self, event: MessageEvent) -> Optional[Dict[str, Any]]:
+        if event.message_type != MessageType.TEXT:
+            return None
+        text = (event.text or "").lstrip()
+        if text.startswith("[inkbox:sms ") or text.startswith("[inkbox:sms_burst "):
+            return {"mode": "queue", "merge_text": True}
+        return None
+
     async def _enqueue_sms_text_event(self, event: MessageEvent) -> None:
         key = self._sms_text_batch_key(event)
         text = event.text or ""
