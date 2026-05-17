@@ -497,7 +497,7 @@ class TestSend:
 
         class FakeInkboxAPIError(Exception):
             status_code = 502
-            detail = {"detail": {"error": "carrier_unavailable", "message": "Failed to reach Telnyx."}}
+            detail = {"detail": {"error": "carrier_unavailable", "message": "Carrier unavailable."}}
 
         identity.send_text.side_effect = FakeInkboxAPIError("unavailable")
 
