@@ -156,19 +156,17 @@ SMS_RATE_LIMIT_ERROR_CODES = frozenset({
     "sender_rate_limited",
 })
 SMS_CONTENT_LENGTH_ERROR_CODES = frozenset({
-    "sms_too_long",
+    # ``message_too_long`` is what the Inkbox server emits for upstream
+    # length rejections. ``sms_too_long`` is set by the local pre-check in
+    # ``_sms_too_long_fields`` and is bypassed by the classifier path (the
+    # failure is constructed directly), so it does not need to live here.
     "message_too_long",
-    "text_too_long",
-    "content_too_long",
-    "body_too_long",
-    "sms_body_too_long",
 })
 SMS_TRANSIENT_ERROR_CODES = frozenset({
     "carrier_unavailable",
 })
 SMS_PERMANENT_ERROR_CODES = frozenset({
     "invalid_phone_number",
-    "message_too_long",
     "carrier_rejected",
 })
 
@@ -343,8 +341,6 @@ def _classify_sms_error(
 
     if any(marker in lower_msg for marker in ("timeout", "temporar", "connection")):
         return ("transient", True)
-    if any(marker in lower_msg for marker in ("too long", "exceeds", "max length", "maximum length")):
-        return ("content_length", False)
     return ("sdk_error", False)
 
 

@@ -1125,6 +1125,58 @@ class TestSend:
         assert result.raw_response["category"] == "content_length"
 
     @pytest.mark.asyncio
+    async def test_speculative_length_codes_no_longer_match_content_length(
+        self, monkeypatch,
+    ):
+        # Codes that the Inkbox server does not emit (text_too_long,
+        # content_too_long, body_too_long, sms_body_too_long) must not be
+        # classified as content_length. With a real 422 status they should
+        # fall through to the permanent bucket via the HTTP-status branch.
+        adapter = _make_adapter(monkeypatch)
+        identity = adapter._inkbox.get_identity.return_value
+
+        class FakeInkboxAPIError(Exception):
+            status_code = 422
+            detail = {"detail": {"error": "text_too_long", "message": "..."}}
+
+        identity.send_text.side_effect = FakeInkboxAPIError("too long")
+
+        result = await adapter.send(
+            "+15555550101",
+            "hello",
+            metadata={"mode": "sms", "to_phone": "+15555550101"},
+        )
+
+        assert result.raw_response["category"] == "permanent"
+        assert result.raw_response["category"] != "content_length"
+
+    @pytest.mark.asyncio
+    async def test_too_long_message_heuristic_no_longer_classifies_content_length(
+        self, monkeypatch,
+    ):
+        # Heuristic message-string match for "too long" / "exceeds" / etc. is
+        # gone now that the code-based classifier is reliable. Without a known
+        # code or 4xx status, a "too long"-ish message must fall through to
+        # sdk_error, not content_length.
+        adapter = _make_adapter(monkeypatch)
+        identity = adapter._inkbox.get_identity.return_value
+
+        class FakeInkboxAPIError(Exception):
+            status_code = None
+            detail = {"message": "Body exceeds maximum length."}
+
+        identity.send_text.side_effect = FakeInkboxAPIError("exceeds max length")
+
+        result = await adapter.send(
+            "+15555550101",
+            "hello",
+            metadata={"mode": "sms", "to_phone": "+15555550101"},
+        )
+
+        assert result.raw_response["category"] == "sdk_error"
+        assert result.raw_response["category"] != "content_length"
+
+    @pytest.mark.asyncio
     async def test_send_sms_marks_server_error_retryable(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         identity = adapter._inkbox.get_identity.return_value
