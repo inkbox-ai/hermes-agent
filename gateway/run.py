@@ -65,10 +65,8 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _INKBOX_SMS_HELP_TEXT_DEFAULT = (
-    "I can help route local vendor requests over SMS.\n"
-    "Text what you need, your location, and any timing/urgency. "
-    "Short follow-ups are fine; I wait a moment before replying.\n"
-    "Commands: /help, /reset, /status, /stop. Text STOP to opt out."
+    "Hi, I'm {identity}. Text what you need and I'll help.\n"
+    "Commands: /help, /reset, /status, /stop. Reply STOP to opt out."
 )
 
 
@@ -9159,16 +9157,37 @@ class GatewayRunner:
         return user_id_alt.startswith("+")
 
     def _inkbox_sms_help_text(self) -> str:
-        """Return deployment-specific end-user help text for Inkbox SMS."""
-        text: Optional[Any] = None
+        """Return deployment-specific end-user help text for Inkbox SMS.
+
+        Resolution order:
+        1. ``extra.sms_help_text`` on the Inkbox platform config — literal,
+           returned as-is.
+        2. ``INKBOX_SMS_HELP_TEXT`` env var — literal, returned as-is.
+        3. Identity-aware default rendered from the configured Inkbox handle.
+        """
         platform_cfg = self.config.platforms.get(Platform.INKBOX)
         extra = getattr(platform_cfg, "extra", {}) if platform_cfg else {}
+
+        override: Optional[Any] = None
         if isinstance(extra, dict):
-            text = extra.get("sms_help_text")
-        if text is None:
-            text = os.getenv("INKBOX_SMS_HELP_TEXT")
-        rendered = str(text).strip() if text is not None else ""
-        return rendered or _INKBOX_SMS_HELP_TEXT_DEFAULT
+            override = extra.get("sms_help_text")
+        if override is None:
+            override = os.getenv("INKBOX_SMS_HELP_TEXT")
+        if override is not None:
+            rendered = str(override).strip()
+            if rendered:
+                # Operator-supplied copy is treated as literal; no .format() so a
+                # stray '{' in custom text doesn't blow up at render time.
+                return rendered
+
+        identity = ""
+        if isinstance(extra, dict):
+            identity = str(extra.get("identity") or "").strip()
+        if not identity:
+            identity = os.getenv("INKBOX_IDENTITY", "").strip()
+        if not identity:
+            identity = "this agent"
+        return _INKBOX_SMS_HELP_TEXT_DEFAULT.format(identity=identity)
 
     async def _handle_inkbox_sms_user_command(
         self,

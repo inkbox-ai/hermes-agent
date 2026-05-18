@@ -795,15 +795,20 @@ class TestInkboxAuthorization:
 
 
 class TestInkboxSmsCommandSurface:
-    def _runner(self, *, sms_help_text=None):
+    def _runner(self, *, sms_help_text=None, identity=None):
         from gateway.config import GatewayConfig
         from gateway.run import GatewayRunner
 
         config = GatewayConfig()
-        if sms_help_text is not None:
+        if sms_help_text is not None or identity is not None:
+            extra: dict[str, str] = {}
+            if sms_help_text is not None:
+                extra["sms_help_text"] = sms_help_text
+            if identity is not None:
+                extra["identity"] = identity
             config.platforms[Platform.INKBOX] = PlatformConfig(
                 enabled=True,
-                extra={"sms_help_text": sms_help_text},
+                extra=extra,
             )
         runner = GatewayRunner(config)
         runner.pairing_store = MagicMock()
@@ -847,6 +852,43 @@ class TestInkboxSmsCommandSurface:
         )._handle_help_command(self._sms_event("/help"))
 
         assert result == "Custom SMS help. Text your request normally."
+
+    @pytest.mark.asyncio
+    async def test_sms_help_default_renders_configured_identity(self):
+        result = await self._runner(identity="zesty-lemon")._handle_help_command(
+            self._sms_event("/help"),
+        )
+
+        assert "Hi, I'm zesty-lemon." in result
+        assert "Reply STOP to opt out" in result
+
+    @pytest.mark.asyncio
+    async def test_sms_help_default_falls_back_to_env_identity(self, monkeypatch):
+        monkeypatch.setenv("INKBOX_IDENTITY", "env-handle")
+        result = await self._runner()._handle_help_command(self._sms_event("/help"))
+
+        assert "Hi, I'm env-handle." in result
+
+    @pytest.mark.asyncio
+    async def test_sms_help_default_uses_neutral_label_without_identity(
+        self, monkeypatch,
+    ):
+        monkeypatch.delenv("INKBOX_IDENTITY", raising=False)
+        result = await self._runner()._handle_help_command(self._sms_event("/help"))
+
+        assert "Hi, I'm this agent." in result
+        assert "local vendor" not in result
+
+    @pytest.mark.asyncio
+    async def test_sms_help_override_with_curly_braces_does_not_format(self):
+        # Custom copy is treated as literal — a stray '{' in operator copy
+        # must not crash the render path.
+        custom = "Hello {weird} unbalanced }} brace"
+        result = await self._runner(sms_help_text=custom)._handle_help_command(
+            self._sms_event("/help"),
+        )
+
+        assert result == custom
 
     @pytest.mark.asyncio
     async def test_sms_commands_uses_same_compact_surface(self):
