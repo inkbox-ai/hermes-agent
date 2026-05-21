@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock, patch
 
 from gateway.platforms.base import BasePlatformAdapter, SendResult, _RETRYABLE_ERROR_PATTERNS
 from gateway.platforms.base import Platform, PlatformConfig
-from gateway.platforms.base import _sms_rejection_user_notice
 
 
 # ---------------------------------------------------------------------------
@@ -303,104 +302,37 @@ class TestSendWithRetryFallback:
         assert len(adapter._send_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_sms_too_long_sends_short_notice_without_plain_text_fallback(self):
+    @pytest.mark.parametrize("error_code", [
+        "sms_too_long",
+        "message_too_long",
+        "content_flagged_as_spam",
+        "content_rejected_by_carrier",
+        "content_blocked_by_policy",
+    ])
+    async def test_sms_rejection_returns_failure_without_sending_notice(self, error_code):
+        """When a send fails with a known SMS rejection error code, the gateway
+        must NOT send a user-facing notice into the thread. Deciding how to
+        react (try different wording, switch channels, apologize, escalate, …)
+        is a product decision that belongs to the agent loop. The gateway just
+        returns the failure result with the specific ``error_code`` exposed on
+        ``raw_response`` so the agent can decide."""
         adapter = _StubAdapter()
-        long_sms = "x" * 2000
         adapter._send_results = [
             SendResult(
                 success=False,
-                error=(
-                    "Inkbox SMS send failed [sms_too_long]: "
-                    f"SMS content is {len(long_sms)} characters; maximum is 1600."
-                ),
-                raw_response={"error_code": "sms_too_long"},
+                error=f"Inkbox SMS send failed [{error_code}]: rejected",
+                raw_response={"error_code": error_code},
                 fallback_allowed=False,
             ),
-            SendResult(success=True, message_id="notice-ok"),
         ]
         with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             result = await adapter._send_with_retry(
-                "chat1", long_sms, max_retries=2, base_delay=0,
+                "chat1", "hello", max_retries=2, base_delay=0,
             )
-
         mock_sleep.assert_not_called()
         assert not result.success
-        assert len(adapter._send_calls) == 2
-        assert "too long for SMS" in adapter._send_calls[1][1]
-        assert "plain text" not in adapter._send_calls[1][1].lower()
-
-
-# ---------------------------------------------------------------------------
-# SMS rejection notice mapping (length + content-rejection codes)
-# ---------------------------------------------------------------------------
-
-class TestSmsRejectionNotice:
-    """Pins the public-error-code → user-facing notice mapping.
-
-    Without these, server-side SMS rejections silently disappear from the
-    user's thread instead of producing a one-line "what happened" reply.
-    """
-
-    def test_message_too_long_returns_length_notice(self):
-        notice = _sms_rejection_user_notice("message_too_long")
-        assert notice is not None
-        assert "too long for SMS" in notice
-
-    def test_sms_too_long_legacy_alias_still_returns_length_notice(self):
-        # ``sms_too_long`` is what the local pre-flight failure path tags;
-        # the server-side equivalent is ``message_too_long``. Both must
-        # produce the same notice so the user-facing behavior stays the
-        # same regardless of which layer caught the overflow.
-        assert _sms_rejection_user_notice("sms_too_long") == _sms_rejection_user_notice("message_too_long")
-
-    def test_content_flagged_as_spam_returns_spam_notice(self):
-        notice = _sms_rejection_user_notice("content_flagged_as_spam")
-        assert notice is not None
-        assert "spam filter" in notice.lower()
-        # Notice should hint at a remediation (different wording or email)
-        assert "email" in notice.lower()
-
-    def test_content_rejected_by_carrier_returns_carrier_notice(self):
-        notice = _sms_rejection_user_notice("content_rejected_by_carrier")
-        assert notice is not None
-        assert "carrier rejected" in notice.lower()
-        assert "email" in notice.lower()
-
-    def test_content_blocked_by_policy_returns_policy_notice(self):
-        notice = _sms_rejection_user_notice("content_blocked_by_policy")
-        assert notice is not None
-        assert "blocked by carrier policy" in notice.lower()
-        assert "email" in notice.lower()
-
-    def test_unknown_error_code_returns_none(self):
-        # Falls through so callers do not spam the user with a bogus notice
-        # for an error type we have not classified yet.
-        assert _sms_rejection_user_notice("totally_made_up_code") is None
-
-    def test_non_string_returns_none(self):
-        # Defensive — error_code on raw_response can be anything if the SDK
-        # response shape ever shifts; do not blow up on int / None / dict.
-        assert _sms_rejection_user_notice(None) is None
-        assert _sms_rejection_user_notice(42) is None
-        assert _sms_rejection_user_notice({"foo": "bar"}) is None
-
-    @pytest.mark.asyncio
-    async def test_content_flagged_as_spam_sends_notice_into_thread(self):
-        adapter = _StubAdapter()
-        adapter._send_results = [
-            SendResult(
-                success=False,
-                error="Inkbox SMS send failed [content_flagged_as_spam]: rejected by spam filter",
-                raw_response={"error_code": "content_flagged_as_spam"},
-                fallback_allowed=False,
-            ),
-            SendResult(success=True, message_id="notice-ok"),
-        ]
-        with patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await adapter._send_with_retry(
-                "chat1", "привіт", max_retries=2, base_delay=0,
-            )
-        assert not result.success
-        # First call = the original failed send; second = the notice.
-        assert len(adapter._send_calls) == 2
-        assert "spam filter" in adapter._send_calls[1][1].lower()
+        # Exactly one send attempt — the original. NO follow-up notice.
+        assert len(adapter._send_calls) == 1
+        # The error_code is preserved on raw_response so the agent loop can
+        # branch on it after the failure bubbles up.
+        assert result.raw_response["error_code"] == error_code

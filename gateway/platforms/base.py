@@ -1288,52 +1288,6 @@ def resolve_channel_skills(
     return None
 
 
-# Public SMS rejection error codes the Inkbox API may surface on a failed
-# send. Each maps to a one-line, vendor-neutral notice the gateway sends
-# back into the user's SMS thread so the agent's reply doesn't silently
-# disappear when the carrier rejects it. Keep these short — they ship as
-# real SMS and count against the 1600-char budget themselves.
-_SMS_REJECTION_NOTICES: dict[str, str] = {
-    # Length — both names because the server-side name is ``message_too_long``
-    # but the local pre-flight failure path still tags rows as ``sms_too_long``.
-    "message_too_long": (
-        "That response is too long for SMS, so I did not send it. "
-        "Ask a narrower question, or use email for a fuller reply."
-    ),
-    "sms_too_long": (
-        "That response is too long for SMS, so I did not send it. "
-        "Ask a narrower question, or use email for a fuller reply."
-    ),
-    # Spam-filter rejection — common on UCS-2 / non-English content from
-    # US 10DLC numbers. Retrying the same body is guaranteed to fail.
-    "content_flagged_as_spam": (
-        "A carrier spam filter blocked that reply. Try different wording "
-        "(short, ASCII, no links) or ask me to email it instead."
-    ),
-    # Carrier rejected the body for non-spam reasons (encoding/format/policy).
-    "content_rejected_by_carrier": (
-        "The carrier rejected that reply. Try different wording or ask me "
-        "to email it instead."
-    ),
-    # Permanent compliance/policy block.
-    "content_blocked_by_policy": (
-        "That content is blocked by carrier policy and cannot be sent via "
-        "SMS. Ask me to email it instead."
-    ),
-}
-
-
-def _sms_rejection_user_notice(error_code: object) -> str | None:
-    """Return a user-facing one-line notice for an SMS send-rejection code.
-
-    Returns ``None`` for unknown / non-SMS errors so callers can fall through
-    to their existing handling without spamming the user with bogus notices.
-    """
-    if not isinstance(error_code, str):
-        return None
-    return _SMS_REJECTION_NOTICES.get(error_code)
-
-
 class BasePlatformAdapter(ABC):
     """
     Base class for platform adapters.
@@ -2645,29 +2599,18 @@ class BasePlatformAdapter(ABC):
                 return result
 
         if not result.fallback_allowed:
-            logger.warning(
-                "[%s] Send failed: %s — not attempting plain-text fallback",
-                self.name, error_str,
-            )
+            # Return the failure as-is. Do not generate a user-facing notice
+            # here — choosing how to react to a permanent send failure (try
+            # different wording, switch channels, escalate, apologize, …) is
+            # a product decision that belongs to the agent loop, not the
+            # gateway. The agent sees ``result.success=False`` plus the
+            # specific ``error_code`` on ``result.raw_response`` and decides.
             raw_response = result.raw_response if isinstance(result.raw_response, dict) else {}
-            # Map server-side SMS rejection codes to a one-line user-facing
-            # notice. Without this, the send silently fails and the user
-            # never sees an acknowledgement. Keys here are the public error
-            # names — vendor codes stay invisible.
-            notice = _sms_rejection_user_notice(raw_response.get("error_code"))
-            if notice:
-                try:
-                    await self.send(
-                        chat_id=chat_id,
-                        content=notice,
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                except Exception as notify_err:
-                    logger.debug(
-                        "[%s] Could not send SMS rejection notice: %s",
-                        self.name, notify_err,
-                    )
+            logger.warning(
+                "[%s] Send failed (no fallback, no notice — agent decides): "
+                "error_code=%s message=%s",
+                self.name, raw_response.get("error_code"), error_str,
+            )
             return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
