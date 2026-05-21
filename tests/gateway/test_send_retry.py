@@ -303,7 +303,6 @@ class TestSendWithRetryFallback:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("error_code", [
-        "sms_too_long",
         "message_too_long",
         "content_flagged_as_spam",
         "content_rejected_by_carrier",

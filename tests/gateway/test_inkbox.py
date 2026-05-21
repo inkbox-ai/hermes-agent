@@ -1061,7 +1061,10 @@ class TestSend:
         assert result.success is False
         assert result.retryable is False
         assert result.fallback_allowed is False
-        assert result.raw_response["error_code"] == "sms_too_long"
+        # Pre-flight and server-side rejections collapse onto the same public
+        # error code so SDK consumers branch on one name regardless of which
+        # layer caught the overflow.
+        assert result.raw_response["error_code"] == "message_too_long"
         assert result.raw_response["category"] == "content_length"
         assert result.raw_response["char_count"] == 1601
         assert result.raw_response["max_chars"] == 1600
@@ -1246,7 +1249,7 @@ class TestSend:
         )
 
         assert result["success"] is False
-        assert result["error_code"] == "sms_too_long"
+        assert result["error_code"] == "message_too_long"
         assert result["category"] == "content_length"
         assert result["retryable"] is False
         assert result["fallback_allowed"] is False

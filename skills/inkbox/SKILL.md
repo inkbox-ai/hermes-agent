@@ -280,7 +280,7 @@ In Hermes-routed Inkbox sessions, inbound human SMS fragments are buffered per c
 
 - Allowed only from **local** numbers, not toll-free.
 - **15 outbound sends per phone number per rolling 24h.**
-- Hermes does not chunk long SMS replies automatically. Messages over 1600 chars fail before send with `sms_too_long`; shorten the response, ask a follow-up, or use email.
+- Hermes does not chunk long SMS replies automatically. Messages over 1600 chars fail before send with `message_too_long`; shorten the response, ask a follow-up, or use email.
 - New local numbers need **~10-15 min** for 10DLC carrier propagation. `identity.phone_number.sms_status` is `SmsStatus.PENDING` until ready; sends in this window return `409 sender_sms_pending`.
 - `409 messaging_profile_disabled` means the sender is not currently enabled for outbound SMS. Treat it as a non-retryable provisioning issue; changing text content or retrying immediately will not fix it.
 - Recipient must have texted **`START`** to any number in the org. Unknown → `403 recipient_not_opted_in`. `STOP` → `403 recipient_opted_out`.
@@ -827,7 +827,7 @@ In Hermes-routed Inkbox sessions, inbound human SMS fragments are buffered per c
 
 - Allowed only from **local** numbers, not toll-free.
 - **15 sends per phone number per rolling 24h.**
-- Hermes does not chunk long SMS replies automatically. Messages over 1600 chars fail before send with `sms_too_long`; shorten the response, ask a follow-up, or use email.
+- Hermes does not chunk long SMS replies automatically. Messages over 1600 chars fail before send with `message_too_long`; shorten the response, ask a follow-up, or use email.
 - A freshly provisioned local number needs **~10-15 min** for 10DLC carrier propagation. Inspect with `inkbox number get <id>`; sending is gated until `smsStatus` reads `ready` (otherwise `409 sender_sms_pending`).
 - `409 messaging_profile_disabled` is a sender provisioning state problem. Do not immediate-retry or vary the message body; inspect the number/provisioning state and escalate through Inkbox operations.
 - Recipient must have texted **`START`** to any number in the org. Unknown → `403 recipient_not_opted_in`. `STOP` → `403 recipient_opted_out`.

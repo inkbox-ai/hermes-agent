@@ -155,14 +155,7 @@ SMS_RATE_LIMIT_ERROR_CODES = frozenset({
     "carrier_rate_limit",
     "sender_rate_limited",
 })
-SMS_CONTENT_LENGTH_ERROR_CODES = frozenset({
-    "sms_too_long",
-    "message_too_long",
-    "text_too_long",
-    "content_too_long",
-    "body_too_long",
-    "sms_body_too_long",
-})
+SMS_CONTENT_LENGTH_ERROR_CODES = frozenset({"message_too_long"})
 SMS_TRANSIENT_ERROR_CODES = frozenset({
     "carrier_unavailable",
     # Carrier said "I'm temporarily down" — distinct from a 5xx vendor
@@ -369,7 +362,7 @@ def _sms_too_long_fields(content: str, *, max_chars: int = SMS_MAX_LENGTH) -> Di
     char_count = len(content or "")
     return {
         "status_code": None,
-        "error_code": "sms_too_long",
+        "error_code": "message_too_long",
         "message": f"SMS content is {char_count} characters; maximum is {max_chars}.",
         "detail": None,
         "category": "content_length",
