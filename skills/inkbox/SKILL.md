@@ -287,48 +287,7 @@ In Hermes-routed Inkbox sessions, inbound human SMS fragments are buffered per c
 
 **Coming soon:** toll-free SMS sending, customer-managed 10DLC brands/campaigns (drastically higher per-number limits).
 
-### When a send fails — what to do per error code
-
-`identity.send_text(...)` raises `InkboxAPIError` on rejection; the actionable code is in `e.detail["error"]`. In Hermes-routed sessions the gateway raises the same way internally and the rejection bubbles back into the next turn instead of being silently dropped — read `e.detail["error"]` and decide.
-
-The default playbook for each code below assumes you are mid-reply to a user who's texting you. If the user is contactable on a second channel (you know an email for them, you have an active call open, etc.), prefer that channel **only** when the SMS path is permanently blocked for that content — not as the first move.
-
-**`message_too_long`** — body exceeds carrier length limits.
-1. First try: tighten the reply. Remove preamble, drop unneeded context, cut to the answer. SMS is short-form; verbose is the problem.
-2. If you can fit a *useful* reply under ~1400 ASCII / ~560 Cyrillic-or-emoji characters, send the shortened version.
-3. If the answer genuinely needs more space (long lists, full documents, multi-paragraph reasoning), ask the user: *"That's too long to text — want me to email it instead?"* If their contact has a known email, you can offer the email directly (`identity.send_email(...)`) and follow up with one SMS like *"Sent it to your email."*.
-4. Do **not** repeatedly retry the same body — it will fail the same way.
-
-**`content_flagged_as_spam`** — carrier spam filter blocked the body. This fires hard on UCS-2 / non-English content (single Cyrillic, Chinese, Hebrew, or emoji char flips the whole message to UCS-2 and US 10DLC filters score that very high), on URLs, and on certain banned keywords.
-1. Do **not** retry the same body. The filter will fire again deterministically.
-2. Try rewriting in plain ASCII English, dropping links, dropping urgency/financial words, and shortening. Send the rewrite.
-3. If the user-facing content fundamentally needs non-ASCII (a name in Cyrillic, a foreign-language quote, etc.), switch to email if you know the contact's email. SMS can't carry it on this carrier path.
-4. If you don't know a second channel and the rewrite isn't viable, send a short ASCII apology explaining the carrier blocked the reply and ask for an email address.
-
-**`content_rejected_by_carrier`** — carrier rejected the body for non-spam reasons (encoding, format, policy). Less common than spam, but treat similarly: do not retry the same body, try simpler / shorter / plainer content, fall back to email if you know one.
-
-**`content_blocked_by_policy`** — permanent compliance/policy block. Carrier will never deliver this content via SMS regardless of phrasing.
-1. Do **not** retry on SMS at all — wording changes won't help.
-2. If you know the contact's email, send it there. Acknowledge on SMS with one short line: *"Couldn't send that here — emailed it to you."*
-3. If no email is known, tell the user briefly and ask for an email address.
-
-**`carrier_temporarily_unavailable`** — transient carrier-infra hiccup. The gateway retries this for you automatically; the agent shouldn't see it unless retries are exhausted, in which case acknowledge briefly (*"Texting's been flaky for a sec — give it a minute."*) and move on.
-
-**`invalid_phone_number`** — the destination address is malformed or unroutable. Don't retry to that number. Ask the user to confirm the number or pick a different recipient.
-
-**`recipient_opted_out` / `recipient_not_opted_in`** — consent gate, not a content problem. The recipient texted `STOP`, or never texted `START` to any of your numbers.
-1. Do **not** retry on SMS. Re-sending is not just useless, it's a compliance violation.
-2. If you have the recipient's email, send it there instead. Mention briefly that they aren't opted in for SMS.
-3. If you only have SMS, surface this to the user clearly — the recipient must text `START` first.
-
-**`sender_sms_pending`** — your sender number is still propagating through 10DLC (10–15 min after provisioning). Don't retry tight-loop; wait and try again in a few minutes, or use email/another channel for time-sensitive replies.
-
-**`messaging_profile_disabled` / `sender_not_registered` / `sender_registration_required`** — provisioning issues you cannot fix from inside the agent. Don't retry. Surface the failure to the user briefly and route urgent content via email if you have one.
-
-**`carrier_rate_limit` / `sender_rate_limited`** — you've sent too many texts in the rolling 24h window (15/number/day on Inkbox-default-campaign senders). Back off and retry later, or send the urgent ones via email.
-
-### Common pitfall: language detection
-A single non-ASCII character (`'`, `–`, `…`, emoji, Cyrillic, CJK) flips the whole message to UCS-2 — which halves the per-segment budget *and* sharply raises the spam-filter score. When composing an SMS reply, prefer straight ASCII (`'` not `'`, `-` not `–`, `...` not `…`). Save the typographically pretty form for email.
+**When a send fails** (`InkboxAPIError` on direct SDK use, or the same `error_code` on a Hermes-routed `SendResult` failure), branch on `e.detail["error"]`: `message_too_long` → tighten the reply first (target ~1400 ASCII / ~560 UCS-2), only offer email when the content genuinely won't fit; `content_flagged_as_spam` → do **not** retry the same body (filter is deterministic), rewrite in plain ASCII without links/emoji/non-English, switch to email if you know one; `content_rejected_by_carrier` → simpler/plainer content, then email; `content_blocked_by_policy` → permanent, switch channels immediately, brief SMS ack only; `carrier_temporarily_unavailable` → gateway auto-retries, only ack if exhausted; `invalid_phone_number` → confirm number with the user; `recipient_opted_out` / `recipient_not_opted_in` → consent gate (do not retry on SMS — compliance issue), use email if known or surface that the recipient must text `START`; `sender_sms_pending` → wait 10–15 min (10DLC propagation) or use email for time-sensitive; `messaging_profile_disabled` / `sender_not_registered` / `sender_registration_required` → provisioning, surface + use email; `carrier_rate_limit` / `sender_rate_limited` → 24h/15-msg cap hit, back off or email. **Pitfall:** any single non-ASCII char (`'`, `–`, `…`, emoji, Cyrillic, CJK) flips the whole message to UCS-2, halving the per-segment budget *and* sharply raising US 10DLC spam-score — prefer straight ASCII for SMS (`'` not `'`, `-` not `–`, `...` not `…`), save pretty typography for email.
 
 ```python
 # Send an SMS from this identity's phone number.
