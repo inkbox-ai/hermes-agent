@@ -165,12 +165,29 @@ SMS_CONTENT_LENGTH_ERROR_CODES = frozenset({
 })
 SMS_TRANSIENT_ERROR_CODES = frozenset({
     "carrier_unavailable",
+    # Carrier said "I'm temporarily down" — distinct from a 5xx vendor
+    # failure. Same body is safe to retry after a backoff.
+    "carrier_temporarily_unavailable",
+})
+# Content-rejection codes — the server now distinguishes these from the
+# generic ``carrier_rejected`` bucket so we can branch on cause:
+#   * content_flagged_as_spam — carrier or upstream spam filter blocked
+#     the body. Retrying the same content will hit the same filter; e.g.
+#     non-English / UCS-2 text from a US 10DLC number trips this.
+#   * content_rejected_by_carrier — body rejected for non-spam reasons
+#     (encoding/format/policy). Remediation is fix-the-body, not retry.
+#   * content_blocked_by_policy — permanent compliance/policy block.
+# All three are permanent for the same body, so callers must not retry.
+SMS_CONTENT_REJECTED_ERROR_CODES = frozenset({
+    "content_flagged_as_spam",
+    "content_rejected_by_carrier",
+    "content_blocked_by_policy",
 })
 SMS_PERMANENT_ERROR_CODES = frozenset({
     "invalid_phone_number",
     "message_too_long",
     "carrier_rejected",
-})
+}) | SMS_CONTENT_REJECTED_ERROR_CODES
 
 # Hermes emits a few classes of admin/system notice via adapter.send() —
 # session-reset banners ("◐ ..."), runtime info blocks ("◆ Model: ..."),
