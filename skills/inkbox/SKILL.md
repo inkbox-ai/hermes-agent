@@ -280,12 +280,14 @@ In Hermes-routed Inkbox sessions, inbound human SMS fragments are buffered per c
 
 - Allowed only from **local** numbers, not toll-free.
 - **15 outbound sends per phone number per rolling 24h.**
-- Hermes does not chunk long SMS replies automatically. Messages over 1600 chars fail before send with `sms_too_long`; shorten the response, ask a follow-up, or use email.
+- Hermes does not chunk long SMS replies automatically. Messages over 1600 chars fail before send with `message_too_long`; shorten the response, ask a follow-up, or use email.
 - New local numbers need **~10-15 min** for 10DLC carrier propagation. `identity.phone_number.sms_status` is `SmsStatus.PENDING` until ready; sends in this window return `409 sender_sms_pending`.
-- `409 messaging_profile_disabled` means the sender's carrier messaging profile is disabled upstream/provider-side. Treat it as a non-retryable provisioning issue; changing text content or retrying immediately will not fix it.
+- `409 messaging_profile_disabled` means the sender is not currently enabled for outbound SMS. Treat it as a non-retryable provisioning issue; changing text content or retrying immediately will not fix it.
 - Recipient must have texted **`START`** to any number in the org. Unknown → `403 recipient_not_opted_in`. `STOP` → `403 recipient_opted_out`.
 
 **Coming soon:** toll-free SMS sending, customer-managed 10DLC brands/campaigns (drastically higher per-number limits).
+
+**When a send fails** (`InkboxAPIError` on direct SDK use, or the same `error_code` on a Hermes-routed `SendResult` failure), branch on `e.detail["error"]`: `message_too_long` → tighten the reply first (target ~1400 ASCII / ~560 UCS-2), only offer email when the content genuinely won't fit; `content_flagged_as_spam` → do **not** retry the same body (filter is deterministic), rewrite in plain ASCII without links/emoji/non-English, switch to email if you know one; `content_rejected_by_carrier` / `carrier_rejected` (generic catch-all) → simpler/plainer content, then email; `content_blocked_by_policy` → permanent, switch channels immediately, brief SMS ack only; `carrier_temporarily_unavailable` / `carrier_unavailable` → gateway auto-retries, only ack if exhausted; `invalid_phone_number` → confirm number with the user; `recipient_opted_out` / `recipient_not_opted_in` / `recipient_blocked` → consent or block gate (do not retry on SMS — compliance issue), use email if known or surface that the recipient must text `START`; `sender_sms_pending` → wait 10–15 min (10DLC propagation) or use email for time-sensitive; `messaging_profile_disabled` / `sender_not_registered` / `sender_registration_required` / `sender_sms_assignment_failed` → provisioning (some permanent), surface + use email; `toll_free_sms_unsupported` → this sender can't text at all, use email; `carrier_rate_limit` / `sender_rate_limited` → 24h/15-msg cap hit, back off or email. **Pitfall:** any single non-ASCII char (`'`, `–`, `…`, emoji, Cyrillic, CJK) flips the whole message to UCS-2, halving the per-segment budget *and* sharply raising US 10DLC spam-score — prefer straight ASCII for SMS (`'` not `'`, `-` not `–`, `...` not `…`), save pretty typography for email.
 
 ```python
 # Send an SMS from this identity's phone number.
@@ -825,9 +827,9 @@ In Hermes-routed Inkbox sessions, inbound human SMS fragments are buffered per c
 
 - Allowed only from **local** numbers, not toll-free.
 - **15 sends per phone number per rolling 24h.**
-- Hermes does not chunk long SMS replies automatically. Messages over 1600 chars fail before send with `sms_too_long`; shorten the response, ask a follow-up, or use email.
+- Hermes does not chunk long SMS replies automatically. Messages over 1600 chars fail before send with `message_too_long`; shorten the response, ask a follow-up, or use email.
 - A freshly provisioned local number needs **~10-15 min** for 10DLC carrier propagation. Inspect with `inkbox number get <id>`; sending is gated until `smsStatus` reads `ready` (otherwise `409 sender_sms_pending`).
-- `409 messaging_profile_disabled` is a sender provisioning/provider state problem. Do not immediate-retry or vary the message body; inspect the number/provisioning state and escalate to Inkbox/provider operations.
+- `409 messaging_profile_disabled` is a sender provisioning state problem. Do not immediate-retry or vary the message body; inspect the number/provisioning state and escalate through Inkbox operations.
 - Recipient must have texted **`START`** to any number in the org. Unknown → `403 recipient_not_opted_in`. `STOP` → `403 recipient_opted_out`.
 
 **Coming soon:** toll-free SMS sending, customer-managed 10DLC brands/campaigns (drastically higher per-number limits).

@@ -1291,7 +1291,7 @@ def resolve_channel_skills(
 class BasePlatformAdapter(ABC):
     """
     Base class for platform adapters.
-    
+
     Subclasses implement platform-specific logic for:
     - Connecting and authenticating
     - Receiving messages
@@ -2599,28 +2599,18 @@ class BasePlatformAdapter(ABC):
                 return result
 
         if not result.fallback_allowed:
-            logger.warning(
-                "[%s] Send failed: %s — not attempting plain-text fallback",
-                self.name, error_str,
-            )
+            # Return the failure as-is. Do not generate a user-facing notice
+            # here — choosing how to react to a permanent send failure (try
+            # different wording, switch channels, escalate, apologize, …) is
+            # a product decision that belongs to the agent loop, not the
+            # gateway. The agent sees ``result.success=False`` plus the
+            # specific ``error_code`` on ``result.raw_response`` and decides.
             raw_response = result.raw_response if isinstance(result.raw_response, dict) else {}
-            if raw_response.get("error_code") == "sms_too_long":
-                notice = (
-                    "That response is too long for SMS, so I did not send it. "
-                    "Ask a narrower question, or use email for a fuller reply."
-                )
-                try:
-                    await self.send(
-                        chat_id=chat_id,
-                        content=notice,
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                except Exception as notify_err:
-                    logger.debug(
-                        "[%s] Could not send SMS-length failure notice: %s",
-                        self.name, notify_err,
-                    )
+            logger.warning(
+                "[%s] Send failed (no fallback, no notice — agent decides): "
+                "error_code=%s message=%s",
+                self.name, raw_response.get("error_code"), error_str,
+            )
             return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback

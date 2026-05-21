@@ -302,28 +302,36 @@ class TestSendWithRetryFallback:
         assert len(adapter._send_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_sms_too_long_sends_short_notice_without_plain_text_fallback(self):
+    @pytest.mark.parametrize("error_code", [
+        "message_too_long",
+        "content_flagged_as_spam",
+        "content_rejected_by_carrier",
+        "content_blocked_by_policy",
+    ])
+    async def test_sms_rejection_returns_failure_without_sending_notice(self, error_code):
+        """When a send fails with a known SMS rejection error code, the gateway
+        must NOT send a user-facing notice into the thread. Deciding how to
+        react (try different wording, switch channels, apologize, escalate, …)
+        is a product decision that belongs to the agent loop. The gateway just
+        returns the failure result with the specific ``error_code`` exposed on
+        ``raw_response`` so the agent can decide."""
         adapter = _StubAdapter()
-        long_sms = "x" * 2000
         adapter._send_results = [
             SendResult(
                 success=False,
-                error=(
-                    "Inkbox SMS send failed [sms_too_long]: "
-                    f"SMS content is {len(long_sms)} characters; maximum is 1600."
-                ),
-                raw_response={"error_code": "sms_too_long"},
+                error=f"Inkbox SMS send failed [{error_code}]: rejected",
+                raw_response={"error_code": error_code},
                 fallback_allowed=False,
             ),
-            SendResult(success=True, message_id="notice-ok"),
         ]
         with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             result = await adapter._send_with_retry(
-                "chat1", long_sms, max_retries=2, base_delay=0,
+                "chat1", "hello", max_retries=2, base_delay=0,
             )
-
         mock_sleep.assert_not_called()
         assert not result.success
-        assert len(adapter._send_calls) == 2
-        assert "too long for SMS" in adapter._send_calls[1][1]
-        assert "plain text" not in adapter._send_calls[1][1].lower()
+        # Exactly one send attempt — the original. NO follow-up notice.
+        assert len(adapter._send_calls) == 1
+        # The error_code is preserved on raw_response so the agent loop can
+        # branch on it after the failure bubbles up.
+        assert result.raw_response["error_code"] == error_code

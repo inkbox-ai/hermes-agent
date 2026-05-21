@@ -1061,7 +1061,10 @@ class TestSend:
         assert result.success is False
         assert result.retryable is False
         assert result.fallback_allowed is False
-        assert result.raw_response["error_code"] == "sms_too_long"
+        # Pre-flight and server-side rejections collapse onto the same public
+        # error code so SDK consumers branch on one name regardless of which
+        # layer caught the overflow.
+        assert result.raw_response["error_code"] == "message_too_long"
         assert result.raw_response["category"] == "content_length"
         assert result.raw_response["char_count"] == 1601
         assert result.raw_response["max_chars"] == 1600
@@ -1147,6 +1150,64 @@ class TestSend:
         assert result.raw_response["category"] == "transient"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_code", [
+        "content_flagged_as_spam",
+        "content_rejected_by_carrier",
+        "content_blocked_by_policy",
+    ])
+    async def test_send_sms_content_rejection_classifies_as_permanent(self, monkeypatch, error_code):
+        """Server-side content-rejection codes must classify as permanent so the
+        retry plumbing stops and the rejection-notice path fires instead.
+        Without this, the gateway would keep retrying a body that will always
+        be rejected (spam filter / banned content / policy block)."""
+        adapter = _make_adapter(monkeypatch)
+        identity = adapter._inkbox.get_identity.return_value
+
+        class FakeInkboxAPIError(Exception):
+            status_code = 422
+            detail = {"detail": {"error": error_code, "message": "rejected"}}
+
+        identity.send_text.side_effect = FakeInkboxAPIError("rejected")
+        result = await adapter.send(
+            "+15555550101",
+            "hello",
+            metadata={"mode": "sms", "to_phone": "+15555550101"},
+        )
+
+        assert result.success is False
+        assert result.retryable is False
+        assert result.fallback_allowed is False
+        assert result.raw_response["error_code"] == error_code
+        assert result.raw_response["category"] == "permanent"
+
+    @pytest.mark.asyncio
+    async def test_send_sms_carrier_temporarily_unavailable_is_retryable(self, monkeypatch):
+        """``carrier_temporarily_unavailable`` is a specific carrier hint that
+        retrying the same body after a backoff is safe — distinct from the
+        generic 5xx/``carrier_unavailable`` bucket."""
+        adapter = _make_adapter(monkeypatch)
+        identity = adapter._inkbox.get_identity.return_value
+
+        class FakeInkboxAPIError(Exception):
+            status_code = 502
+            detail = {"detail": {
+                "error": "carrier_temporarily_unavailable",
+                "message": "Carrier is temporarily unavailable; retry later.",
+            }}
+
+        identity.send_text.side_effect = FakeInkboxAPIError("unavailable")
+        result = await adapter.send(
+            "+15555550101",
+            "hello",
+            metadata={"mode": "sms", "to_phone": "+15555550101"},
+        )
+
+        assert result.success is False
+        assert result.retryable is True
+        assert result.raw_response["error_code"] == "carrier_temporarily_unavailable"
+        assert result.raw_response["category"] == "transient"
+
+    @pytest.mark.asyncio
     async def test_send_email_resolves_address_from_contact_when_chat_id_is_uuid(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         result = await adapter.send(
@@ -1188,7 +1249,7 @@ class TestSend:
         )
 
         assert result["success"] is False
-        assert result["error_code"] == "sms_too_long"
+        assert result["error_code"] == "message_too_long"
         assert result["category"] == "content_length"
         assert result["retryable"] is False
         assert result["fallback_allowed"] is False
