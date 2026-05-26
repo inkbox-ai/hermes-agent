@@ -67,6 +67,7 @@ def _make_runner():
     runner._pending_messages = {}
     runner._busy_ack_ts = {}
     runner._draining = False
+    runner._busy_text_mode = "interrupt"
     runner.adapters = {}
     runner.config = MagicMock()
     runner.session_store = None
@@ -86,6 +87,8 @@ def _make_adapter(platform_val="telegram"):
     adapter.config = MagicMock()
     adapter.config.extra = {}
     adapter.platform = MagicMock(value=platform_val)
+    adapter._text_debounce = {}
+    adapter._busy_text_debounce_seconds = 0.6
     return adapter
 
 
@@ -218,6 +221,7 @@ class TestBusySessionAck:
         assert "Interrupting" not in content
 
     @pytest.mark.asyncio
+<<<<<<< HEAD
     async def test_adapter_policy_can_queue_and_merge_without_interrupt(self):
         """Inkbox SMS follow-ups should merge while active even if global mode interrupts."""
         runner, sentinel = _make_runner()
@@ -253,6 +257,32 @@ class TestBusySessionAck:
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
         assert "Queued for the next turn" in content
         assert "Interrupting" not in content
+=======
+    async def test_busy_text_mode_queue_delegates_to_adapter_handle_message(self):
+        """busy_text_mode=queue lets the adapter debounce text silently."""
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner._busy_text_mode = "queue"
+        adapter = _make_adapter()
+
+        first = _make_event(text="part one")
+        second = _make_event(text="part two")
+        sk = build_session_key(first.source)
+
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+        runner.adapters[first.source.platform] = adapter
+        runner.adapters[second.source.platform] = adapter
+
+        result1 = await runner._handle_active_session_busy_message(first, sk)
+        result2 = await runner._handle_active_session_busy_message(second, sk)
+
+        assert result1 is False
+        assert result2 is False
+        assert sk not in adapter._pending_messages
+        agent.interrupt.assert_not_called()
+        adapter._send_with_retry.assert_not_called()
+>>>>>>> origin/main
 
     @pytest.mark.asyncio
     async def test_steer_mode_calls_agent_steer_no_interrupt_no_queue(self):
