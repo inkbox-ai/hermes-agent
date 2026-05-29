@@ -1879,7 +1879,7 @@ requires-dist = [
     { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = "==0.6.1" },
     { name = "honcho-ai", marker = "extra == 'honcho'", specifier = "==2.0.1" },
     { name = "httpx", extras = ["socks"], specifier = "==0.28.1" },
-    { name = "inkbox", specifier = ">=0.4.5,<1" },
+    { name = "inkbox", specifier = "==0.4.6" },
     { name = "jinja2", specifier = "==3.1.6" },
     { name = "lark-oapi", marker = "extra == 'feishu'", specifier = "==1.5.3" },
     { name = "markdown", marker = "extra == 'matrix'", specifier = "==3.10.2" },
@@ -2149,7 +2149,7 @@ wheels = [
 
 [[package]]
 name = "inkbox"
-version = "0.4.5"
+version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "argon2-cffi" },
@@ -2158,9 +2158,9 @@ dependencies = [
     { name = "h2" },
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/43/9b/ce81f961b57ab700ef71dd6fe0569192d43610cd210cc82c25465b8c981f/inkbox-0.4.5.tar.gz", hash = "sha256:ebae92504662891ad608b83ebbcf2f98c9313acf85aaeb04cb461532ab4cc70a", size = 224109, upload-time = "2026-05-22T22:40:45.242Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7c/0f/0c9d0df2b46ad46a95a78a671325ce214fc0a0271dc7af742417c59d34d1/inkbox-0.4.6.tar.gz", hash = "sha256:fb44ee941bc4203e32ca023572a95273992c6437ff5f007ee3aad89e4575a26a", size = 230362, upload-time = "2026-05-29T18:10:33.389Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1f/c1/7eb4676b26d5c0381af6556cda88b9a7771b7c79d4c8bc9f39dc21d7ee43/inkbox-0.4.5-py3-none-any.whl", hash = "sha256:7cd2a897139b2348fb88fe0a25a03703a01a469eb2d2d2f3651950a31b14eb01", size = 181002, upload-time = "2026-05-22T22:40:43.519Z" },
+    { url = "https://files.pythonhosted.org/packages/a2/4f/e91a8e8eecd32e6abee4a1586fb9e65c4b54f9b5c3700915e23a834322a6/inkbox-0.4.6-py3-none-any.whl", hash = "sha256:a56ab843958a8b2d0f2d363d608986ec526eab3593a9324a48fc7faed9f87eff", size = 185124, upload-time = "2026-05-29T18:10:32.144Z" },
 ]
 
 [[package]]
