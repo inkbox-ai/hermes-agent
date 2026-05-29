@@ -1193,6 +1193,7 @@ AUTHOR_MAP = {
     "m@matthewlai.ca": "matthewlai",  # PR #25293 (feat: gemma 4 reasoning allowlist)
     "4296245+matthewlai@users.noreply.github.com": "matthewlai",
     # Inkbox fork maintainers
+    "alex@vectorly.app": "alex-w-99",
     "dima@vectorly.app": "dimavrem22",
     "dimavrem22@gmail.com": "dimavrem22",
     "inkbox-on-call-agent@inkboxmail.com": "dimavrem22",  # Dima's on-call agent identity
