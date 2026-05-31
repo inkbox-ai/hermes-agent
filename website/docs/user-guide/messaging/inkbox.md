@@ -83,3 +83,56 @@ INKBOX_HOME_CHANNEL=contact-or-phone
 ```
 
 Use `INKBOX_BASE_URL` only for staging or development environments.
+
+## Realtime Voice (OpenAI Realtime API)
+
+By default, inbound phone calls use Inkbox's server-side STT + TTS — the agent exchanges text events on the call WebSocket and Inkbox handles audio in both directions. This works without any OpenAI dependency but adds latency and isn't truly interactive.
+
+When you set an OpenAI API key and enable the realtime bridge, inbound calls are streamed end-to-end through the [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime) instead. The caller talks to an OpenAI voice model (e.g. `gpt-realtime` with the `alloy` voice) in real time, with G.711 μ-law audio bridged through Hermes' Inkbox WS handler.
+
+The realtime model has access to two tools:
+
+- **`hermes_agent_consult`** — pauses the live conversation, dispatches a one-shot `hermes -z PROMPT` invocation of the main Hermes agent (with full tool access), and reads the agent's reply back to the caller. Use for anything that needs current external data, session search, calendar lookups, or other agentic work mid-call.
+- **`register_post_call_action`** — queues a follow-up task. When the call ends, all queued actions are dispatched as a single synthetic SMS-mode turn so the main agent executes them with its full toolset (send email, update contact, create note, etc.).
+
+### Enable
+
+```bash
+INKBOX_REALTIME_ENABLED=true
+OPENAI_API_KEY=sk-...                            # or INKBOX_REALTIME_API_KEY
+INKBOX_REALTIME_MODEL=gpt-realtime               # optional, default shown
+INKBOX_REALTIME_VOICE=alloy                      # optional, default shown
+INKBOX_REALTIME_CONSULT_TIMEOUT_S=60             # optional, default shown
+```
+
+Or under `platforms.inkbox.realtime` in `~/.hermes/config.yaml`:
+
+```yaml
+platforms:
+  inkbox:
+    realtime:
+      enabled: true
+      api_key: sk-...                            # falls back to OPENAI_API_KEY
+      model: gpt-realtime
+      voice: alloy
+      additional_instructions: |
+        Always end the call with "Anything else?"
+      consult_timeout_s: 60
+```
+
+If `enabled: true` but no API key is found, the bridge falls back to the legacy Inkbox-side STT/TTS path and logs a warning at startup — calls still work, just without the realtime voice model.
+
+### How it works
+
+1. The call WS handler in `gateway/platforms/inkbox.py:_handle_call_ws` accepts the Inkbox WebSocket with `x-use-inkbox-text-to-speech: false` and `x-use-inkbox-speech-to-text: false` so Inkbox forwards raw μ-law frames.
+2. `gateway/platforms/inkbox_realtime.py:run_inkbox_realtime_bridge` opens a WS to `wss://api.openai.com/v1/realtime?model=<model>` with the API key, sends `session.update` with the tools + instructions + audio format, and starts two concurrent pumps.
+3. Caller audio: Inkbox → Hermes (μ-law base64 in `media` events) → OpenAI (`input_audio_buffer.append`).
+4. Model audio: OpenAI (`response.audio.delta`) → Hermes → Inkbox (`media` events).
+5. Tool calls: `response.function_call_arguments.done` → adapter callback → `submitToolResult` via `conversation.item.create` + `response.create`.
+6. On `hermes_agent_consult`, the bridge fires an interim "Say only 'One moment.'" instruction so the model fills dead air while the spawned `hermes -z` invocation runs.
+
+### Limitations
+
+- **Codex tokens aren't supported yet.** The Realtime API expects an OpenAI API key (`sk-...`). Codex's OAuth tokens authenticate against `chatgpt.com/backend-api/codex`, which doesn't (currently) expose a public Realtime surface. Tracked separately.
+- **Subprocess-based agent consult.** The mid-call agent invocation spawns `hermes -z PROMPT` rather than dispatching in-process. Adds ~2s startup latency per consult but gives clean isolation from concurrent calls and full agent tooling. In-process dispatch is on the roadmap.
+- **No barge-in customization.** The bridge uses OpenAI server-side VAD with default thresholds (`silence_duration_ms: 500`, `interrupt_response: true`). Tuning hooks are not exposed yet.
