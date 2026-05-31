@@ -1249,6 +1249,7 @@ AUTHOR_MAP = {
     "dima@vectorly.app": "dimavrem22",
     "dimavrem22@gmail.com": "dimavrem22",
     "inkbox-on-call-agent@inkboxmail.com": "dimavrem22",  # Dima's on-call agent identity
+    "redpiggy-cyber@users.noreply.github.com": "RedPiggy",  # introduced via upstream sync 2026-05-31
     "mfzeidan@gmail.com": "mfzeidan",
     "mark@zeidan.ai": "mfzeidan",
     "109617724+0xchainer@users.noreply.github.com": "0xchainer",  # PR #27154/27138/27147 salvage
