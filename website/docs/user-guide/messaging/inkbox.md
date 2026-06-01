@@ -83,3 +83,76 @@ INKBOX_HOME_CHANNEL=contact-or-phone
 ```
 
 Use `INKBOX_BASE_URL` only for staging or development environments.
+
+## Realtime Voice (OpenAI Realtime API)
+
+By default, inbound phone calls use Inkbox's server-side STT + TTS — the agent exchanges text events on the call WebSocket and Inkbox handles audio in both directions. This works without any OpenAI dependency but adds latency and isn't truly interactive.
+
+When an OpenAI credential is available, inbound calls are streamed end-to-end through the [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime) instead. The caller talks to an OpenAI GA Realtime voice model (default `gpt-realtime-2` with the `cedar` voice) in real time, with G.711 μ-law audio bridged through Hermes' Inkbox WS handler. The agent greets the caller proactively, so the line never opens with silence.
+
+The realtime model has access to two tools:
+
+- **`hermes_agent_consult`** — pauses the live conversation, dispatches a one-shot `hermes -z PROMPT` invocation of the main Hermes agent (with full tool access), and reads the agent's reply back to the caller. Use for anything that needs current external data, session search, calendar lookups, or other agentic work mid-call.
+- **`register_post_call_action`** — queues a follow-up task. When the call ends, all queued actions are dispatched as a single synthetic SMS-mode turn so the main agent executes them with its full toolset (send email, update contact, create note, etc.).
+
+### Credentials
+
+The bridge accepts either:
+
+1. A standard OpenAI Platform **API key** (`sk-...`) — used directly.
+2. The agent's existing **ChatGPT/Codex OAuth** login — exchanged at `POST /v1/realtime/client_secrets` for an ephemeral client secret per call. This is the zero-config path: if the agent is already logged in via `hermes auth add openai-codex`, realtime works with no extra key.
+
+### Enablement (auto-detect)
+
+Realtime is **tri-state** ("auto unless explicitly disabled"):
+
+| `INKBOX_REALTIME_ENABLED` / `realtime.enabled` | OpenAI credential present? | Result |
+|---|---|---|
+| unset | yes | **realtime on** (auto) |
+| unset | no | Inkbox STT/TTS (no credential) |
+| `true` | yes | realtime on |
+| `true` | no | Inkbox STT/TTS + startup warning |
+| `false` | either | Inkbox STT/TTS (explicit opt-out) |
+
+"Credential present" means an API key (`realtime.api_key`, `INKBOX_REALTIME_API_KEY`, or `OPENAI_API_KEY`) **or** a Codex OAuth login. API key is preferred when both exist. Set `INKBOX_REALTIME_ENABLED=false` to opt out.
+
+```bash
+# Optional overrides (none required if the agent is Codex-authed)
+INKBOX_REALTIME_ENABLED=false                    # explicit opt-out
+OPENAI_API_KEY=sk-...                            # or INKBOX_REALTIME_API_KEY
+INKBOX_REALTIME_MODEL=gpt-realtime-2             # optional, default shown
+INKBOX_REALTIME_VOICE=cedar                      # optional, default shown
+INKBOX_REALTIME_CONSULT_TIMEOUT_S=60             # optional, default shown
+```
+
+Or under `platforms.inkbox.realtime` in `~/.hermes/config.yaml`:
+
+```yaml
+platforms:
+  inkbox:
+    realtime:
+      # enabled: false                           # omit for auto; set false to opt out
+      api_key: sk-...                            # optional; falls back to OPENAI_API_KEY / Codex OAuth
+      model: gpt-realtime-2
+      voice: cedar
+      additional_instructions: |
+        Always end the call with "Anything else?"
+      consult_timeout_s: 60
+```
+
+If realtime is explicitly enabled but no credential is found, the bridge falls back to the legacy Inkbox-side STT/TTS path and logs a warning at startup — calls still work, just without the realtime voice model.
+
+### How it works
+
+1. The call WS handler in `gateway/platforms/inkbox.py:_handle_call_ws` accepts the Inkbox WebSocket with `x-use-inkbox-text-to-speech: false` and `x-use-inkbox-speech-to-text: false` so Inkbox forwards raw μ-law frames.
+2. `gateway/platforms/inkbox_realtime.py:run_inkbox_realtime_bridge` resolves the bearer (the `sk-` API key directly, or an ephemeral client secret minted from the Codex/ChatGPT OAuth token), opens a WS to `wss://api.openai.com/v1/realtime?model=<model>`, sends the **GA-schema** `session.update` (nested `audio.input` / `audio.output`, `output_modalities: ["audio"]`, audio format object `{"type": "audio/pcmu"}`) required by the GA models, and starts two concurrent pumps. The legacy flat `input_audio_format` shape used by the older `gpt-4o-realtime-preview` beta models is **not** sent — GA rejects it.
+3. Caller audio: Inkbox → Hermes (μ-law base64 in `media` events) → OpenAI (`input_audio_buffer.append`). The `start` event's `stream_id` is captured for outbound frames.
+4. Model audio: OpenAI (`response.output_audio.delta`) → Hermes → Inkbox `media` frames tagged `track: "outbound"` with the `stream_id`. `response.output_audio.done` emits an `audio_done` frame; OpenAI `input_audio_buffer.speech_started` (caller barge-in) emits a `clear` frame to drop queued audio.
+5. The full resolved contact (name, emails, phones, company, notes) is loaded into the model's instructions at call start (only when a contact actually matched), so it knows who's calling without a mid-call lookup.
+6. Tool calls: accumulated by `item_id` (name from `response.output_item.added`, args from `response.function_call_arguments.delta/.done`, with `response.output_item.done` as a fallback), then dispatched once → adapter callback → `submitToolResult` via `conversation.item.create` + `response.create`.
+7. On `hermes_agent_consult`, the bridge fires an interim "Say only 'One moment.'" instruction so the model fills dead air while the spawned `hermes -z` invocation runs.
+
+### Limitations
+
+- **Subprocess-based agent consult.** The mid-call agent invocation spawns `hermes -z PROMPT` rather than dispatching in-process. Adds ~2s startup latency per consult but gives clean isolation from concurrent calls and full agent tooling. In-process dispatch is on the roadmap.
+- **No barge-in customization.** The bridge uses OpenAI server-side VAD with default thresholds (`silence_duration_ms: 500`, `interrupt_response: true`). Tuning hooks are not exposed yet.
