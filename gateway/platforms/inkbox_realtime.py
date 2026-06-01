@@ -46,9 +46,19 @@ except ImportError:  # pragma: no cover — aiohttp is a core dep on this fork
 logger = logging.getLogger(__name__)
 
 REALTIME_URL = "wss://api.openai.com/v1/realtime"
-DEFAULT_MODEL = "gpt-realtime"
+# GA Realtime model. Matches openclaw-core's
+# extensions/openai/realtime-voice-provider.ts OPENAI_REALTIME_DEFAULT_MODEL.
+# The GA models (gpt-realtime, gpt-realtime-2) use the *nested* session
+# schema (audio.input / audio.output) — NOT the older flat
+# input_audio_format / output_audio_format shape used by the beta
+# gpt-4o-realtime-preview models. See _send_session_update.
+DEFAULT_MODEL = "gpt-realtime-2"
 DEFAULT_VOICE = "alloy"
-AUDIO_FORMAT_TELEPHONY = "g711_ulaw"
+# Telephony audio is G.711 μ-law @ 8 kHz. The GA session schema expects an
+# audio-format *object*, not the legacy "g711_ulaw" string.
+AUDIO_FORMAT_TELEPHONY = {"type": "audio/pcmu"}
+# Transcription model for inbound caller audio (nested under audio.input).
+INPUT_TRANSCRIPTION_MODEL = "whisper-1"
 
 AGENT_CONSULT_TOOL_NAME = "hermes_agent_consult"
 POST_CALL_ACTION_TOOL_NAME = "register_post_call_action"
@@ -285,9 +295,11 @@ async def run_inkbox_realtime_bridge(
 
     state = _BridgeState()
     url = f"{config.base_url}?model={config.model}"
+    # GA Realtime API does not require the ``OpenAI-Beta: realtime=v1`` header
+    # that the beta gpt-4o-realtime-preview models used. openclaw-core's GA
+    # path omits it; we match.
     headers = {
         "Authorization": f"Bearer {config.api_key}",
-        "OpenAI-Beta": "realtime=v1",
     }
 
     session = aiohttp.ClientSession()
@@ -355,27 +367,43 @@ async def run_inkbox_realtime_bridge(
 async def _send_session_update(
     openai_ws: Any, config: RealtimeConfig, meta: RealtimeCallMeta,
 ) -> None:
-    """Send the initial ``session.update`` to configure the OpenAI Realtime session."""
+    """Send the initial ``session.update`` to configure the OpenAI Realtime session.
+
+    Uses the GA session schema (``type: "realtime"``, ``output_modalities``,
+    nested ``audio.input`` / ``audio.output``) required by gpt-realtime /
+    gpt-realtime-2. The legacy flat ``input_audio_format`` / ``modalities``
+    shape is only accepted by the older beta preview models and would be
+    rejected by GA. Mirrors openclaw-core ``buildGaSessionUpdate``.
+    """
     instructions = build_realtime_instructions(meta, config.additional_instructions)
     payload = {
         "type": "session.update",
         "session": {
-            "modalities": ["audio", "text"],
+            "type": "realtime",
+            "model": config.model,
             "instructions": instructions,
-            "voice": config.voice,
-            "input_audio_format": AUDIO_FORMAT_TELEPHONY,
-            "output_audio_format": AUDIO_FORMAT_TELEPHONY,
-            "input_audio_transcription": {"model": "whisper-1"},
-            # Server-side VAD with default settings — the model auto-detects
-            # caller speech start/stop and decides when to respond. The bridge
-            # does NOT manually trigger response.create for each turn.
-            "turn_detection": {
-                "type": "server_vad",
-                "threshold": 0.5,
-                "prefix_padding_ms": 300,
-                "silence_duration_ms": 500,
-                "create_response": True,
-                "interrupt_response": True,
+            "output_modalities": ["audio"],
+            "audio": {
+                "input": {
+                    "format": AUDIO_FORMAT_TELEPHONY,
+                    "noise_reduction": None,
+                    "transcription": {"model": INPUT_TRANSCRIPTION_MODEL},
+                    # Server-side VAD — the model auto-detects caller speech
+                    # start/stop and decides when to respond. The bridge does
+                    # NOT manually trigger response.create per turn.
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 500,
+                        "create_response": True,
+                        "interrupt_response": True,
+                    },
+                },
+                "output": {
+                    "format": AUDIO_FORMAT_TELEPHONY,
+                    "voice": config.voice,
+                },
             },
             "tools": [
                 _agent_consult_tool_schema(),
@@ -454,7 +482,10 @@ async def _openai_to_inkbox_pump(
             continue
         ftype = frame.get("type", "")
 
-        if ftype == "response.audio.delta":
+        # GA models emit ``response.output_audio.delta``; the older beta
+        # models emit ``response.audio.delta``. Handle both so the bridge
+        # works regardless of which model the operator configures.
+        if ftype in ("response.output_audio.delta", "response.audio.delta"):
             # Audio bytes are already μ-law base64. Forward as an Inkbox media
             # frame. Streaming is handled by the realtime model's pacing; we
             # don't need our own jitter buffer for telephony @ 8 kHz.
@@ -469,7 +500,11 @@ async def _openai_to_inkbox_pump(
                     logger.debug("[Inkbox realtime] Inkbox WS send failed: %s", exc)
                     return
 
-        elif ftype == "response.audio_transcript.done":
+        # GA: response.output_audio_transcript.done; beta: response.audio_transcript.done
+        elif ftype in (
+            "response.output_audio_transcript.done",
+            "response.audio_transcript.done",
+        ):
             text = (frame.get("transcript") or "").strip()
             if text:
                 state.transcript.append(("agent", text))

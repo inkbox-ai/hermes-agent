@@ -88,7 +88,7 @@ Use `INKBOX_BASE_URL` only for staging or development environments.
 
 By default, inbound phone calls use Inkbox's server-side STT + TTS — the agent exchanges text events on the call WebSocket and Inkbox handles audio in both directions. This works without any OpenAI dependency but adds latency and isn't truly interactive.
 
-When you set an OpenAI API key and enable the realtime bridge, inbound calls are streamed end-to-end through the [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime) instead. The caller talks to an OpenAI voice model (e.g. `gpt-realtime` with the `alloy` voice) in real time, with G.711 μ-law audio bridged through Hermes' Inkbox WS handler.
+When you set an OpenAI API key and enable the realtime bridge, inbound calls are streamed end-to-end through the [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime) instead. The caller talks to an OpenAI GA Realtime voice model (default `gpt-realtime-2` with the `alloy` voice) in real time, with G.711 μ-law audio bridged through Hermes' Inkbox WS handler.
 
 The realtime model has access to two tools:
 
@@ -100,7 +100,7 @@ The realtime model has access to two tools:
 ```bash
 INKBOX_REALTIME_ENABLED=true
 OPENAI_API_KEY=sk-...                            # or INKBOX_REALTIME_API_KEY
-INKBOX_REALTIME_MODEL=gpt-realtime               # optional, default shown
+INKBOX_REALTIME_MODEL=gpt-realtime-2             # optional, default shown
 INKBOX_REALTIME_VOICE=alloy                      # optional, default shown
 INKBOX_REALTIME_CONSULT_TIMEOUT_S=60             # optional, default shown
 ```
@@ -113,7 +113,7 @@ platforms:
     realtime:
       enabled: true
       api_key: sk-...                            # falls back to OPENAI_API_KEY
-      model: gpt-realtime
+      model: gpt-realtime-2
       voice: alloy
       additional_instructions: |
         Always end the call with "Anything else?"
@@ -125,9 +125,9 @@ If `enabled: true` but no API key is found, the bridge falls back to the legacy 
 ### How it works
 
 1. The call WS handler in `gateway/platforms/inkbox.py:_handle_call_ws` accepts the Inkbox WebSocket with `x-use-inkbox-text-to-speech: false` and `x-use-inkbox-speech-to-text: false` so Inkbox forwards raw μ-law frames.
-2. `gateway/platforms/inkbox_realtime.py:run_inkbox_realtime_bridge` opens a WS to `wss://api.openai.com/v1/realtime?model=<model>` with the API key, sends `session.update` with the tools + instructions + audio format, and starts two concurrent pumps.
+2. `gateway/platforms/inkbox_realtime.py:run_inkbox_realtime_bridge` opens a WS to `wss://api.openai.com/v1/realtime?model=<model>` with the API key, sends the **GA-schema** `session.update` (nested `audio.input` / `audio.output`, `output_modalities: ["audio"]`, audio format object `{"type": "audio/pcmu"}`) required by the GA models, and starts two concurrent pumps. The legacy flat `input_audio_format` shape used by the older `gpt-4o-realtime-preview` beta models is **not** sent — GA rejects it.
 3. Caller audio: Inkbox → Hermes (μ-law base64 in `media` events) → OpenAI (`input_audio_buffer.append`).
-4. Model audio: OpenAI (`response.audio.delta`) → Hermes → Inkbox (`media` events).
+4. Model audio: OpenAI (`response.output_audio.delta`, or `response.audio.delta` on older models — both handled) → Hermes → Inkbox (`media` events).
 5. Tool calls: `response.function_call_arguments.done` → adapter callback → `submitToolResult` via `conversation.item.create` + `response.create`.
 6. On `hermes_agent_consult`, the bridge fires an interim "Say only 'One moment.'" instruction so the model fills dead air while the spawned `hermes -z` invocation runs.
 

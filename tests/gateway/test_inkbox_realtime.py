@@ -20,6 +20,8 @@ import pytest
 
 from gateway.platforms.inkbox_realtime import (
     AGENT_CONSULT_TOOL_NAME,
+    AUDIO_FORMAT_TELEPHONY,
+    DEFAULT_MODEL,
     POST_CALL_ACTION_TOOL_NAME,
     RealtimeCallMeta,
     RealtimeConfig,
@@ -27,6 +29,7 @@ from gateway.platforms.inkbox_realtime import (
     _agent_consult_tool_schema,
     _dispatch_tool_call,
     _post_call_action_tool_schema,
+    _send_session_update,
     build_realtime_instructions,
 )
 
@@ -122,6 +125,47 @@ class TestBuildInstructions:
         text = build_realtime_instructions(_meta())
         assert AGENT_CONSULT_TOOL_NAME in text
         assert POST_CALL_ACTION_TOOL_NAME in text
+
+
+# ─── GA session.update protocol ────────────────────────────────────────────
+
+
+class TestSessionUpdate:
+    def test_default_model_is_ga_v2(self):
+        # We default to the GA gpt-realtime-2 model (matches openclaw-core).
+        assert DEFAULT_MODEL == "gpt-realtime-2"
+
+    def test_telephony_audio_format_is_ga_object(self):
+        # GA expects an audio-format object, not the legacy "g711_ulaw" string.
+        assert AUDIO_FORMAT_TELEPHONY == {"type": "audio/pcmu"}
+
+    @pytest.mark.asyncio
+    async def test_session_update_uses_ga_nested_schema(self):
+        ws = _FakeWS()
+        config = RealtimeConfig(
+            enabled=True, api_key="sk-test", model="gpt-realtime-2", voice="cedar",
+        )
+        await _send_session_update(ws, config, _meta())
+
+        assert len(ws.sent) == 1
+        sess = ws.sent[0]["session"]
+        # GA markers — must NOT use the legacy flat shape.
+        assert sess["type"] == "realtime"
+        assert sess["model"] == "gpt-realtime-2"
+        assert sess["output_modalities"] == ["audio"]
+        assert "modalities" not in sess
+        assert "input_audio_format" not in sess
+        assert "output_audio_format" not in sess
+        # Nested audio config.
+        assert sess["audio"]["input"]["format"] == {"type": "audio/pcmu"}
+        assert sess["audio"]["output"]["format"] == {"type": "audio/pcmu"}
+        assert sess["audio"]["output"]["voice"] == "cedar"
+        assert sess["audio"]["input"]["turn_detection"]["type"] == "server_vad"
+        assert sess["audio"]["input"]["transcription"]["model"]
+        # Tools live at the top of session in GA shape.
+        tool_names = {t["name"] for t in sess["tools"]}
+        assert tool_names == {AGENT_CONSULT_TOOL_NAME, POST_CALL_ACTION_TOOL_NAME}
+        assert sess["tool_choice"] == "auto"
 
 
 # ─── tool dispatch ─────────────────────────────────────────────────────────
