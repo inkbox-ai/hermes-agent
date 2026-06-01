@@ -155,6 +155,9 @@ class RealtimeCallMeta:
     direction: str  # "inbound" or "outbound"
     agent_identity_email: Optional[str] = None
     agent_identity_phone: Optional[str] = None
+    # True only when a real Inkbox contact resolved. When false, contact_name
+    # may be a raw phone number / "unknown" and must NOT be treated as known.
+    contact_known: bool = False
     # Full resolved contact record so the model knows who it's talking to
     # without a mid-call lookup.
     contact_emails: List[str] = field(default_factory=list)
@@ -245,7 +248,7 @@ def build_realtime_instructions(
         lines.append(f"Your phone number: {meta.agent_identity_phone}.")
     if meta.remote_phone_number:
         lines.append(f"Caller is calling from: {meta.remote_phone_number}.")
-    if meta.contact_name and meta.contact_name not in ("unknown", ""):
+    if meta.contact_known and meta.contact_name and meta.contact_name not in ("unknown", ""):
         lines.append(
             "You already know who this is — do NOT look them up or ask for "
             "details you already have below.",
@@ -261,7 +264,8 @@ def build_realtime_instructions(
             lines.append(f"Notes about the caller: {meta.contact_notes}")
     else:
         lines.append(
-            "No matching contact record is loaded; use the phone number or a neutral greeting.",
+            "No matching contact record is loaded — you do NOT know who this is. "
+            "Greet them neutrally; you may look them up by phone number if needed.",
         )
     if meta.direction == "outbound":
         if meta.outbound_purpose:
@@ -308,7 +312,7 @@ def build_realtime_greeting(meta: RealtimeCallMeta) -> str:
     opening message / purpose so the callee immediately knows why we called.
     """
     first_name = ""
-    if meta.contact_name and meta.contact_name not in ("unknown", ""):
+    if meta.contact_known and meta.contact_name and meta.contact_name not in ("unknown", ""):
         first_name = meta.contact_name.split()[0]
 
     if meta.direction == "outbound":
@@ -327,11 +331,12 @@ def build_realtime_greeting(meta: RealtimeCallMeta) -> str:
             "calling. Be specific and concise."
         )
 
-    # Inbound.
-    who = f" {first_name}" if first_name else ""
+    # Inbound. Use the first name only when the contact is known; otherwise
+    # a neutral "there".
+    who = first_name if first_name else "there"
     return (
         f"Greet the caller now as the very first thing you say. Say something "
-        f"like 'Hi{who}, this is your Hermes agent — how can I help?' Keep it to "
+        f"like 'Hi {who}, this is your Hermes agent — how can I help?' Keep it to "
         f"one short sentence and then wait for them to respond."
     )
 
@@ -641,11 +646,30 @@ async def _openai_to_inkbox_pump(
     on_agent_consult: AgentConsultCallback,
 ) -> None:
     """Forward audio + handle tool calls from OpenAI back to Inkbox."""
-    # Accumulator for streaming function call arguments. The Realtime API
-    # delivers args as a sequence of `response.function_call_arguments.delta`
-    # events terminated by `response.function_call_arguments.done`; we collect
-    # by call_id then dispatch on done.
-    pending_calls: Dict[str, str] = {}
+    # Function-call accumulation keyed by item_id: {call_id, name, args}.
+    # The name is reliably present on ``response.output_item.added``; args
+    # stream via ``...arguments.delta`` and finalize on ``...arguments.done``.
+    # We also accept the completed function_call item on
+    # ``response.output_item.done`` / ``conversation.item.done`` as a fallback,
+    # and dedupe by call_id so a call is dispatched at most once.
+    fn_calls: Dict[str, Dict[str, str]] = {}
+    dispatched: set = set()
+
+    async def _finalize_fn_call(entry: Dict[str, str]) -> None:
+        cid = (entry or {}).get("call_id") or ""
+        if not cid or cid in dispatched:
+            return
+        dispatched.add(cid)
+        await _dispatch_tool_call(
+            openai_ws=openai_ws,
+            call_id=cid,
+            name=entry.get("name") or "",
+            arguments_json=entry.get("args") or "{}",
+            state=state,
+            config=config,
+            meta=meta,
+            on_agent_consult=on_agent_consult,
+        )
 
     async for msg in openai_ws:
         if state.closed:
@@ -712,30 +736,45 @@ async def _openai_to_inkbox_pump(
             if text:
                 state.transcript.append(("caller", text))
 
+        # Function-call item announced — capture name/call_id by item_id.
+        elif ftype == "response.output_item.added":
+            item = frame.get("item") or {}
+            if item.get("type") == "function_call":
+                iid = item.get("id") or frame.get("item_id") or ""
+                if iid:
+                    fn_calls[iid] = {
+                        "call_id": item.get("call_id") or "",
+                        "name": item.get("name") or "",
+                        "args": item.get("arguments") or "",
+                    }
+
         elif ftype == "response.function_call_arguments.delta":
-            call_id = frame.get("call_id") or ""
-            delta = frame.get("delta") or ""
-            if call_id:
-                pending_calls[call_id] = pending_calls.get(call_id, "") + delta
+            key = frame.get("item_id") or frame.get("call_id") or ""
+            entry = fn_calls.setdefault(key, {"call_id": "", "name": "", "args": ""})
+            if not entry.get("call_id") and frame.get("call_id"):
+                entry["call_id"] = frame["call_id"]
+            entry["args"] = (entry.get("args") or "") + (frame.get("delta") or "")
 
         elif ftype == "response.function_call_arguments.done":
-            call_id = frame.get("call_id") or ""
-            name = frame.get("name") or ""
-            args_json = (
-                frame.get("arguments")
-                or pending_calls.pop(call_id, "")
-                or "{}"
-            )
-            await _dispatch_tool_call(
-                openai_ws=openai_ws,
-                call_id=call_id,
-                name=name,
-                arguments_json=args_json,
-                state=state,
-                config=config,
-                meta=meta,
-                on_agent_consult=on_agent_consult,
-            )
+            key = frame.get("item_id") or frame.get("call_id") or ""
+            entry = fn_calls.get(key) or fn_calls.get(frame.get("call_id") or "") or {}
+            if frame.get("call_id"):
+                entry["call_id"] = frame["call_id"]
+            if frame.get("name"):
+                entry["name"] = frame["name"]
+            if frame.get("arguments"):
+                entry["args"] = frame["arguments"]
+            await _finalize_fn_call(entry)
+
+        # Fallback: a completed function_call item we haven't dispatched yet.
+        elif ftype in ("response.output_item.done", "conversation.item.done"):
+            item = frame.get("item") or {}
+            if item.get("type") == "function_call":
+                await _finalize_fn_call({
+                    "call_id": item.get("call_id") or "",
+                    "name": item.get("name") or "",
+                    "args": item.get("arguments") or "",
+                })
 
         elif ftype == "response.done":
             resp = frame.get("response") or {}
@@ -747,8 +786,8 @@ async def _openai_to_inkbox_pump(
             err = frame.get("error") or frame
             logger.warning("[Inkbox realtime] OpenAI error event: %s", err)
 
-        # All other event types (session.created, session.updated,
-        # rate_limits.updated, response.output_item.added, …) are ignored.
+        # Other event types (session.created, session.updated,
+        # rate_limits.updated, …) are ignored.
 
 
 async def _dispatch_tool_call(

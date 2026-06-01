@@ -50,6 +50,7 @@ def _meta(**overrides) -> RealtimeCallMeta:
         direction="inbound",
         agent_identity_email="agent@inkboxmail.com",
         agent_identity_phone="+18005550100",
+        contact_known=True,
     )
     base.update(overrides)
     return RealtimeCallMeta(**base)
@@ -105,6 +106,7 @@ class TestBuildInstructions:
 
     def test_full_contact_is_rendered_so_no_lookup_needed(self):
         text = build_realtime_instructions(_meta(
+            contact_known=True,
             contact_name="Dima Vremenko",
             contact_emails=["dima@vectorly.app", "dima@inkbox.ai"],
             contact_phones=["+15167251294"],
@@ -120,8 +122,29 @@ class TestBuildInstructions:
         assert "do NOT look them up" in text
 
     def test_known_contact_with_no_extra_fields_still_works(self):
-        text = build_realtime_instructions(_meta(contact_name="Alex"))
+        text = build_realtime_instructions(_meta(contact_known=True, contact_name="Alex"))
         assert "Caller name: Alex" in text
+
+    def test_unknown_caller_with_phone_is_not_treated_as_known(self):
+        # contact_name is the raw phone number (lookup miss) but contact_known
+        # is False — the model must NOT be told it knows who this is.
+        text = build_realtime_instructions(_meta(
+            contact_known=False,
+            contact_name="+15551234567",
+            remote_phone_number="+15551234567",
+        ))
+        assert "you do NOT know who this is" in text
+        assert "do NOT look them up" not in text
+        assert "Caller name: +15551234567" not in text
+        # Still surfaces the calling number.
+        assert "+15551234567" in text
+
+    def test_unknown_caller_greeting_has_no_name(self):
+        g = build_realtime_greeting(_meta(
+            contact_known=False, contact_name="+15551234567",
+        ))
+        assert "+15551234567" not in g
+        assert "there" in g
 
     def test_outbound_call_includes_purpose_and_opening(self):
         text = build_realtime_instructions(_meta(
@@ -216,10 +239,14 @@ class _FakeMsg:
 
 
 class _FakeOpenAIWS:
-    """Async-iterable fake yielding pre-canned OpenAI Realtime frames."""
+    """Async-iterable fake yielding pre-canned OpenAI Realtime frames.
+
+    Also records anything written back via ``send_str`` (tool results).
+    """
 
     def __init__(self, frames):
         self._frames = [_FakeMsg(json.dumps(f)) for f in frames]
+        self.sent = []
 
     def __aiter__(self):
         self._it = iter(self._frames)
@@ -230,6 +257,28 @@ class _FakeOpenAIWS:
             return next(self._it)
         except StopIteration:
             raise StopAsyncIteration
+
+    async def send_str(self, payload):
+        try:
+            self.sent.append(json.loads(payload))
+        except (TypeError, ValueError):
+            self.sent.append({"_raw": payload})
+
+
+async def _run_openai_pump(frames, state=None):
+    from gateway.platforms.inkbox_realtime import _openai_to_inkbox_pump
+    state = state or _BridgeState()
+    openai_ws = _FakeOpenAIWS(frames)
+
+    async def _noop(*_a, **_k):
+        return ""
+
+    await _openai_to_inkbox_pump(
+        openai_ws=openai_ws, inkbox_ws=_FakeWS(), state=state,
+        config=RealtimeConfig(enabled=True, api_key="sk-x"),
+        meta=_meta(), on_agent_consult=_noop,
+    )
+    return state, openai_ws
 
 
 class TestMediaBridgeParity:
@@ -281,6 +330,63 @@ class TestMediaBridgeParity:
         assert "clear" in events
         done = next(f for f in inkbox_ws.sent if f.get("event") == "audio_done")
         assert done["stream_id"] == "s1"
+
+
+# ─── tool-call event handling (item_id buffer + fallback + dedup) ───────────
+
+
+def _qid():
+    return POST_CALL_ACTION_TOOL_NAME
+
+
+class TestToolCallEventHandling:
+    @pytest.mark.asyncio
+    async def test_standard_added_delta_done_dispatches_once(self):
+        state, _ = await _run_openai_pump([
+            {"type": "response.output_item.added",
+             "item": {"type": "function_call", "id": "item-1", "call_id": "c1", "name": _qid()}},
+            {"type": "response.function_call_arguments.delta", "item_id": "item-1", "delta": '{"act'},
+            {"type": "response.function_call_arguments.delta", "item_id": "item-1", "delta": 'ion":"Email Dima"}'},
+            {"type": "response.function_call_arguments.done", "item_id": "item-1", "call_id": "c1", "name": _qid()},
+        ])
+        assert len(state.post_call_actions) == 1
+        assert state.post_call_actions[0]["action"] == "Email Dima"
+
+    @pytest.mark.asyncio
+    async def test_done_missing_name_uses_buffered_name(self):
+        # `done` omits name; it was captured on output_item.added.
+        state, _ = await _run_openai_pump([
+            {"type": "response.output_item.added",
+             "item": {"type": "function_call", "id": "item-2", "call_id": "c2", "name": _qid()}},
+            {"type": "response.function_call_arguments.delta", "item_id": "item-2", "delta": '{"action":"Note it"}'},
+            {"type": "response.function_call_arguments.done", "item_id": "item-2", "call_id": "c2"},
+        ])
+        assert len(state.post_call_actions) == 1
+        assert state.post_call_actions[0]["action"] == "Note it"
+
+    @pytest.mark.asyncio
+    async def test_conversation_item_done_fallback_dispatches(self):
+        # No arguments.done at all — only the completed item arrives.
+        state, _ = await _run_openai_pump([
+            {"type": "conversation.item.done",
+             "item": {"type": "function_call", "call_id": "c3", "name": _qid(),
+                      "arguments": '{"action":"Send SMS"}'}},
+        ])
+        assert len(state.post_call_actions) == 1
+        assert state.post_call_actions[0]["action"] == "Send SMS"
+
+    @pytest.mark.asyncio
+    async def test_done_and_item_done_dispatch_only_once(self):
+        # Both terminal events arrive for the same call → dispatch exactly once.
+        state, _ = await _run_openai_pump([
+            {"type": "response.output_item.added",
+             "item": {"type": "function_call", "id": "item-4", "call_id": "c4", "name": _qid()}},
+            {"type": "response.function_call_arguments.delta", "item_id": "item-4", "delta": '{"action":"X"}'},
+            {"type": "response.function_call_arguments.done", "item_id": "item-4", "call_id": "c4", "name": _qid()},
+            {"type": "response.output_item.done",
+             "item": {"type": "function_call", "call_id": "c4", "name": _qid(), "arguments": '{"action":"X"}'}},
+        ])
+        assert len(state.post_call_actions) == 1
 
 
 # ─── post-call dispatch (no double side effects) ────────────────────────────

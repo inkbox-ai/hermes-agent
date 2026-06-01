@@ -2325,6 +2325,7 @@ class InkboxAdapter(BasePlatformAdapter):
                         "number",
                         None,
                     ) if identity_for_meta is not None else None,
+                    contact_known=bool(meta.get("contact")),
                     contact_emails=list(rt_contact.get("emails") or []),
                     contact_phones=list(rt_contact.get("phones") or []),
                     contact_company=rt_contact.get("company") or None,
