@@ -888,30 +888,65 @@ class InkboxAdapter(BasePlatformAdapter):
             raw_require_signature = os.getenv("INKBOX_REQUIRE_SIGNATURE", "true")
         self._require_signature = str(raw_require_signature).lower() not in ("false", "0", "no")
 
-        # Realtime voice bridge. When enabled, inbound voice calls are
+        # Realtime voice bridge. When active, inbound voice calls are
         # bridged to OpenAI's Realtime API instead of relying on
         # Inkbox-side STT/TTS. See :mod:`gateway.platforms.inkbox_realtime`.
+        #
+        # Enablement is tri-state, matching openclaw-core's "auto unless
+        # explicitly disabled" behavior:
+        #   - explicit false (realtime.enabled=false / INKBOX_REALTIME_ENABLED=false)
+        #     -> OFF, always.
+        #   - explicit true  -> ON if an OpenAI key is present; warn + fall back
+        #     to Inkbox STT/TTS if no key.
+        #   - unset          -> AUTO: ON whenever any OpenAI key is present
+        #     (realtime.api_key / INKBOX_REALTIME_API_KEY / OPENAI_API_KEY).
+        #
         # Config shape under ``platforms.inkbox.realtime`` in config.yaml:
-        #   enabled: bool
+        #   enabled: bool (optional — omit for auto)
         #   api_key: str (or read from OPENAI_API_KEY / INKBOX_REALTIME_API_KEY env)
-        #   model: str (default "gpt-realtime")
+        #   model: str (default "gpt-realtime-2")
         #   voice: str (default "alloy")
         #   additional_instructions: str
         #   consult_timeout_s: float
         rt_extra = extra.get("realtime") if isinstance(extra.get("realtime"), dict) else {}
-        rt_enabled_raw = (
-            rt_extra.get("enabled")
-            if "enabled" in rt_extra
-            else os.getenv("INKBOX_REALTIME_ENABLED", "false")
-        )
-        rt_enabled = str(rt_enabled_raw).lower() in ("true", "1", "yes")
+        # Resolve the tri-state setting: True/False if explicitly set, else None.
+        rt_setting: Optional[bool] = None
+        if "enabled" in rt_extra:
+            rt_setting = str(rt_extra.get("enabled")).strip().lower() in ("true", "1", "yes")
+        else:
+            rt_env = os.getenv("INKBOX_REALTIME_ENABLED")
+            if rt_env is not None and rt_env.strip() != "":
+                rt_setting = rt_env.strip().lower() in ("true", "1", "yes")
+
         rt_api_key = (
             (rt_extra.get("api_key") or "").strip()
             or os.getenv("INKBOX_REALTIME_API_KEY", "").strip()
             or os.getenv("OPENAI_API_KEY", "").strip()
         )
+
+        if rt_setting is False:
+            rt_enabled = False
+        elif rt_setting is True:
+            # Explicitly requested — needs a key to actually run.
+            rt_enabled = bool(rt_api_key)
+            if not rt_api_key:
+                logger.warning(
+                    "[Inkbox] realtime voice was explicitly enabled but no OpenAI "
+                    "API key was found (checked realtime.api_key, "
+                    "INKBOX_REALTIME_API_KEY, OPENAI_API_KEY); falling back to "
+                    "Inkbox-side STT/TTS for calls.",
+                )
+        else:
+            # Unset -> auto-detect: on whenever an OpenAI key is available.
+            rt_enabled = bool(rt_api_key)
+            if rt_enabled:
+                logger.info(
+                    "[Inkbox] realtime voice auto-enabled (OpenAI key present; "
+                    "set INKBOX_REALTIME_ENABLED=false to disable).",
+                )
+
         self._realtime_config = RealtimeConfig(
-            enabled=rt_enabled and bool(rt_api_key),
+            enabled=rt_enabled,
             api_key=rt_api_key,
             model=str(rt_extra.get("model") or os.getenv("INKBOX_REALTIME_MODEL") or REALTIME_DEFAULT_MODEL),
             voice=str(rt_extra.get("voice") or os.getenv("INKBOX_REALTIME_VOICE") or REALTIME_DEFAULT_VOICE),
@@ -922,12 +957,6 @@ class InkboxAdapter(BasePlatformAdapter):
                 or REALTIME_DEFAULT_CONSULT_TIMEOUT_S
             ),
         )
-        if rt_enabled and not rt_api_key:
-            logger.warning(
-                "[Inkbox] realtime voice was enabled but no OpenAI API key was found "
-                "(checked realtime.api_key, INKBOX_REALTIME_API_KEY, OPENAI_API_KEY); "
-                "falling back to Inkbox-side STT/TTS for calls.",
-            )
         self._sms_text_batch_delay_seconds = _float_setting(
             extra,
             "sms_text_batch_delay_seconds",
@@ -2220,10 +2249,51 @@ class InkboxAdapter(BasePlatformAdapter):
         self._active_call_ws[contact_id] = ws
         self._last_inbound_modality[str(contact_id)] = "voice"
 
+        # Outbound-call purpose: the agent that placed the call writes a
+        # context file under ``$HERMES_HOME/inkbox_call_contexts/<token>.json``
+        # and includes ``?context_token=<token>`` on the WS URL.  We load it
+        # here so the in-call agent — which runs in a brand-new session and
+        # has zero memory of why it's calling — can be told the reason on
+        # its first transcript turn.
+        call_context: Dict[str, Any] = {}
+        ctx_token = (request.query.get("context_token") or "").strip()
+        if ctx_token:
+            try:
+                from hermes_cli.config import get_hermes_home
+                ctx_path = get_hermes_home() / "inkbox_call_contexts" / f"{ctx_token}.json"
+                if ctx_path.exists():
+                    call_context = json.loads(ctx_path.read_text())
+                    # Single-use: drop the file so abandoned tokens don't pile up.
+                    with suppress(Exception):
+                        ctx_path.unlink()
+                else:
+                    logger.warning(
+                        "[Inkbox] Outbound-call context_token %s not found at %s",
+                        ctx_token, ctx_path,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[Inkbox] Failed to load context_token %s: %s", ctx_token, exc,
+                )
+
+        logger.info(
+            "[Inkbox] Call WS open: call_id=%s contact_id=%s remote=%s "
+            "direction=%s thread=%s context=%s",
+            call_id, contact_id, meta.get("remote_phone_number"),
+            direction, call_thread_id,
+            (call_context.get("reason") or "")[:80] if call_context else "(none)",
+        )
+
         # Realtime voice bridge — when configured, hand the WS off to the
-        # OpenAI Realtime API bridge instead of the legacy text-event
-        # flow below. The bridge owns the WS lifecycle until call end and
-        # then we fall through to the post-call cleanup at the bottom.
+        # OpenAI Realtime API bridge instead of the legacy text-event flow
+        # below. The bridge owns the WS lifecycle until call end; on return
+        # we run the post-call cleanup and return the WS response.
+        #
+        # NOTE: this branch MUST come after ``call_context`` is loaded above
+        # (it reads purpose/opening_message from it). Placing it earlier
+        # crashes the call because ``call_context`` would be the raw
+        # X-Call-Context header string (or unbound when signature
+        # verification is off).
         if self._realtime_config.enabled:
             try:
                 identity_for_meta = None
@@ -2273,41 +2343,6 @@ class InkboxAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             return ws
-
-        # Outbound-call purpose: the agent that placed the call writes a
-        # context file under ``$HERMES_HOME/inkbox_call_contexts/<token>.json``
-        # and includes ``?context_token=<token>`` on the WS URL.  We load it
-        # here so the in-call agent — which runs in a brand-new session and
-        # has zero memory of why it's calling — can be told the reason on
-        # its first transcript turn.
-        call_context: Dict[str, Any] = {}
-        ctx_token = (request.query.get("context_token") or "").strip()
-        if ctx_token:
-            try:
-                from hermes_cli.config import get_hermes_home
-                ctx_path = get_hermes_home() / "inkbox_call_contexts" / f"{ctx_token}.json"
-                if ctx_path.exists():
-                    call_context = json.loads(ctx_path.read_text())
-                    # Single-use: drop the file so abandoned tokens don't pile up.
-                    with suppress(Exception):
-                        ctx_path.unlink()
-                else:
-                    logger.warning(
-                        "[Inkbox] Outbound-call context_token %s not found at %s",
-                        ctx_token, ctx_path,
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "[Inkbox] Failed to load context_token %s: %s", ctx_token, exc,
-                )
-
-        logger.info(
-            "[Inkbox] Call WS open: call_id=%s contact_id=%s remote=%s "
-            "direction=%s thread=%s context=%s",
-            call_id, contact_id, meta.get("remote_phone_number"),
-            direction, call_thread_id,
-            (call_context.get("reason") or "")[:80] if call_context else "(none)",
-        )
 
         async def _send_text_delta(text: str, *, turn_id: str) -> None:
             await ws.send_str(json.dumps(

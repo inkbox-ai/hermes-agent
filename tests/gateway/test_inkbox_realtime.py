@@ -396,11 +396,37 @@ class TestAdapterRealtimeConfig:
         )
         return InkboxAdapter(cfg)
 
-    def test_realtime_disabled_by_default(self, monkeypatch):
+    def test_realtime_off_when_no_key_and_unset(self, monkeypatch):
+        # No key anywhere + no explicit flag -> auto-detect finds nothing -> off.
         monkeypatch.delenv("INKBOX_REALTIME_ENABLED", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("INKBOX_REALTIME_API_KEY", raising=False)
         adapter = self._make(monkeypatch)
+        assert adapter._realtime_config.enabled is False
+
+    def test_realtime_auto_enables_on_openai_key(self, monkeypatch):
+        # Auto-detect (OpenClaw parity): a generic OPENAI_API_KEY with NO
+        # explicit flag turns realtime on.
+        monkeypatch.delenv("INKBOX_REALTIME_ENABLED", raising=False)
+        monkeypatch.delenv("INKBOX_REALTIME_API_KEY", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-generic")
+        adapter = self._make(monkeypatch)
+        assert adapter._realtime_config.enabled is True
+        assert adapter._realtime_config.api_key == "sk-generic"
+
+    def test_realtime_explicit_disable_wins_over_key(self, monkeypatch):
+        # Explicit disable must beat an auto-detect that would otherwise
+        # enable from the present key.
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-present")
+        monkeypatch.setenv("INKBOX_REALTIME_ENABLED", "false")
+        adapter = self._make(monkeypatch)
+        assert adapter._realtime_config.enabled is False
+
+    def test_realtime_config_disable_wins_over_key(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-present")
+        adapter = self._make(monkeypatch, extra_overrides={
+            "realtime": {"enabled": False},
+        })
         assert adapter._realtime_config.enabled is False
 
     def test_realtime_enabled_with_api_key_via_env(self, monkeypatch):
@@ -410,9 +436,9 @@ class TestAdapterRealtimeConfig:
         assert adapter._realtime_config.enabled is True
         assert adapter._realtime_config.api_key == "sk-test-abc"
 
-    def test_realtime_enabled_without_api_key_falls_back(self, monkeypatch):
-        # User sets enabled=true but forgets to set an API key — must not
-        # crash; bridge stays disabled so calls fall back to the text path.
+    def test_realtime_explicit_enable_without_api_key_falls_back(self, monkeypatch):
+        # enabled=true but no API key — must not crash; bridge stays disabled
+        # so calls fall back to the text path.
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("INKBOX_REALTIME_API_KEY", raising=False)
         adapter = self._make(monkeypatch, extra_overrides={

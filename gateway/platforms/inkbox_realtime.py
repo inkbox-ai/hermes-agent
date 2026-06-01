@@ -604,10 +604,13 @@ async def _dispatch_tool_call(
         # the model says "one moment" while the agent thinks. The final tool
         # result is what the model uses to compose the actual spoken answer.
         try:
+            # GA response.create uses ``output_modalities`` (not the beta
+            # ``modalities``). We override instructions for just this turn so
+            # the model says a short filler line while the agent runs.
             await openai_ws.send_str(json.dumps({
                 "type": "response.create",
                 "response": {
-                    "modalities": ["audio", "text"],
+                    "output_modalities": ["audio"],
                     "instructions": (
                         "Say only 'One moment.' Do not mention waiting for "
                         "context or checking a lookup."
@@ -675,9 +678,12 @@ async def _submit_tool_result(
                 "output": json.dumps(output),
             },
         }))
+        # Bare response.create — let the session's configured output
+        # modalities + audio settings apply. Matches openclaw-core's
+        # ``sendEvent({ type: "response.create" })``. Passing a beta-style
+        # ``modalities`` field here would be rejected by GA models.
         await openai_ws.send_str(json.dumps({
             "type": "response.create",
-            "response": {"modalities": ["audio", "text"]},
         }))
     except Exception as exc:
         logger.debug("[Inkbox realtime] submit_tool_result failed: %s", exc)

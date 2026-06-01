@@ -88,18 +88,33 @@ Use `INKBOX_BASE_URL` only for staging or development environments.
 
 By default, inbound phone calls use Inkbox's server-side STT + TTS — the agent exchanges text events on the call WebSocket and Inkbox handles audio in both directions. This works without any OpenAI dependency but adds latency and isn't truly interactive.
 
-When you set an OpenAI API key and enable the realtime bridge, inbound calls are streamed end-to-end through the [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime) instead. The caller talks to an OpenAI GA Realtime voice model (default `gpt-realtime-2` with the `alloy` voice) in real time, with G.711 μ-law audio bridged through Hermes' Inkbox WS handler.
+When an OpenAI API key is available, inbound calls are streamed end-to-end through the [OpenAI Realtime API](https://platform.openai.com/docs/guides/realtime) instead. The caller talks to an OpenAI GA Realtime voice model (default `gpt-realtime-2` with the `alloy` voice) in real time, with G.711 μ-law audio bridged through Hermes' Inkbox WS handler.
 
 The realtime model has access to two tools:
 
 - **`hermes_agent_consult`** — pauses the live conversation, dispatches a one-shot `hermes -z PROMPT` invocation of the main Hermes agent (with full tool access), and reads the agent's reply back to the caller. Use for anything that needs current external data, session search, calendar lookups, or other agentic work mid-call.
 - **`register_post_call_action`** — queues a follow-up task. When the call ends, all queued actions are dispatched as a single synthetic SMS-mode turn so the main agent executes them with its full toolset (send email, update contact, create note, etc.).
 
-### Enable
+### Enablement (auto-detect)
+
+Realtime is **tri-state**, matching the OpenClaw plugin's "auto unless explicitly disabled" behavior:
+
+| `INKBOX_REALTIME_ENABLED` / `realtime.enabled` | OpenAI key present? | Result |
+|---|---|---|
+| unset | yes | **realtime on** (auto) |
+| unset | no | Inkbox STT/TTS (no key to use) |
+| `true` | yes | realtime on |
+| `true` | no | Inkbox STT/TTS + startup warning |
+| `false` | either | Inkbox STT/TTS (explicit opt-out) |
+
+"OpenAI key present" means any of `realtime.api_key`, `INKBOX_REALTIME_API_KEY`, or the generic `OPENAI_API_KEY`. So if you already have `OPENAI_API_KEY` set, **realtime turns on automatically** — set `INKBOX_REALTIME_ENABLED=false` to opt out.
 
 ```bash
-INKBOX_REALTIME_ENABLED=true
+# Auto: just having a key enables it
 OPENAI_API_KEY=sk-...                            # or INKBOX_REALTIME_API_KEY
+
+# Optional overrides
+INKBOX_REALTIME_ENABLED=false                    # explicit opt-out
 INKBOX_REALTIME_MODEL=gpt-realtime-2             # optional, default shown
 INKBOX_REALTIME_VOICE=alloy                      # optional, default shown
 INKBOX_REALTIME_CONSULT_TIMEOUT_S=60             # optional, default shown
@@ -111,7 +126,7 @@ Or under `platforms.inkbox.realtime` in `~/.hermes/config.yaml`:
 platforms:
   inkbox:
     realtime:
-      enabled: true
+      # enabled: false                           # omit for auto; set false to opt out
       api_key: sk-...                            # falls back to OPENAI_API_KEY
       model: gpt-realtime-2
       voice: alloy
@@ -120,7 +135,7 @@ platforms:
       consult_timeout_s: 60
 ```
 
-If `enabled: true` but no API key is found, the bridge falls back to the legacy Inkbox-side STT/TTS path and logs a warning at startup — calls still work, just without the realtime voice model.
+If realtime is explicitly enabled but no API key is found, the bridge falls back to the legacy Inkbox-side STT/TTS path and logs a warning at startup — calls still work, just without the realtime voice model.
 
 ### How it works
 
