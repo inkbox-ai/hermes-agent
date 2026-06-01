@@ -32,7 +32,15 @@ If an SMS turn arrives while Hermes is already running for that contact, the gat
 
 Slash commands bypass SMS batching and routing markers, so a text such as `/approve` or `/deny` reaches the Hermes command parser as a command rather than tagged SMS body text. Carrier protocol words such as `START`, `STOP`, `HELP`, `YES`, `SUBSCRIBE`, `INFO`, and `UNSUBSCRIBE` are treated as SMS control traffic and are acknowledged at the webhook layer without starting an agent turn.
 
-Outbound SMS is queued with `identity.send_text(to=..., text=...)`. The adapter returns a `SendResult` with the Inkbox text id and non-body metadata such as `delivery_status`. Hermes does not chunk long SMS replies automatically; content over the Inkbox SMS limit fails before send with `sms_too_long` rather than being silently truncated.
+Outbound SMS is queued with `identity.send_text(...)`. When the adapter knows the conversation the inbound text belonged to, it replies by `conversation_id` (the conversation-centric text API) rather than a bare `to=` phone number — this keeps threading correct and is the only way to answer a group. Otherwise it falls back to `to=<E.164>`. The adapter returns a `SendResult` with the Inkbox text id and non-body metadata such as `delivery_status`. Hermes does not chunk long SMS replies automatically; content over the Inkbox SMS limit fails before send with `sms_too_long` rather than being silently truncated.
+
+### Group texts
+
+Inkbox texts can be group conversations (2–8 participants). The adapter detects a group from the conversation summary (`is_group` / `participants`) or when a webhook matches more than one remote party, and keys the agent session by the conversation UUID (`chat_type=group`) so every participant's messages share one thread. Inbound group messages carry an `[inkbox:group_sms conversation_id=… from=… participants=… reply_mode=conversation_id | …]` marker plus a response policy:
+
+> Reply only when the latest message clearly addresses this agent, asks it to act, or a visible answer would be expected. Treat ordinary group chatter as context only. If no visible reply is warranted, return exactly `[SILENT]`.
+
+A `[SILENT]` reply is suppressed before send (the same sentinel the cron scheduler uses), so the agent can follow a group thread silently and only speak when actually addressed. Group replies are always sent by `conversation_id`.
 
 Important SMS gates are enforced by Inkbox and carriers:
 

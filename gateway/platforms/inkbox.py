@@ -138,6 +138,20 @@ SMS_TEXT_BATCH_DELAY_SECONDS = 0.0
 SMS_TEXT_BATCH_MAX_MESSAGES = 8
 SMS_TEXT_BATCH_MAX_CHARS = 4000
 
+# Group texts: the agent receives every message so it can follow the thread,
+# but should stay quiet unless actually addressed. The [SILENT] sentinel is
+# suppressed at send() (same mechanism as the cron "nothing to say" path).
+GROUP_SMS_POLICY = (
+    "Group SMS response policy: you receive every message in this group so you "
+    "can track context.\n"
+    "Reply only when the latest message clearly addresses this agent, asks it "
+    "to act, or a visible answer would be expected from the agent.\n"
+    "Treat ordinary group chatter as context only.\n"
+    "If no visible reply is warranted, return exactly [SILENT]."
+)
+# Per-conversation summary cache TTL (seconds).
+SMS_CONV_SUMMARY_TTL = 120.0
+
 # Mail: agent only acts on inbound; lifecycle events fire-and-forget at the
 # wire layer, so subscribing to them would pay signature cost for no behaviour.
 _DESIRED_MAIL_EVENTS: tuple[str, ...] = ("message.received",)
@@ -1023,6 +1037,14 @@ class InkboxAdapter(BasePlatformAdapter):
         # `+` or `@` to disambiguate) — without this, send() defaults the
         # mode by chat_id shape and would email an SMS reply.
         self._last_inbound_modality: Dict[str, str] = {}
+        # chat_id → most-recent text conversation UUID, so an outbound SMS
+        # reply routes into the same conversation (the conversation-centric
+        # text API) instead of a bare 1:1 phone number. Group chats always
+        # reply by conversation_id.
+        self._sms_conversation: Dict[str, str] = {}
+        # conversation UUID → cached (is_group, participants) summary, with a
+        # short TTL, to avoid re-listing conversations on every inbound text.
+        self._sms_conv_summary: Dict[str, tuple] = {}
         # chat_id → unix timestamp at which the contact's call WS most-recently
         # closed.  send() consults this to drop replies generated during the
         # short window after a call ends — when the agent's last in-call turn
@@ -1512,22 +1534,39 @@ class InkboxAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"get_identity failed: {exc}")
 
         if mode == "sms":
-            to_number = str(meta.get("to_phone") or chat_id).strip()
-            if not to_number.startswith("+"):
-                # chat_id is a contact UUID (or unknown shape) — look up the
-                # primary phone number on the contact record.
-                to_number = await asyncio.to_thread(self._lookup_contact_phone, chat_id)
-                if not to_number:
-                    return SendResult(
-                        success=False,
-                        error=f"No phone number on contact {chat_id}",
-                    )
+            # Prefer replying into the existing conversation (group chats can
+            # ONLY be answered this way; 1:1 also routes here when we know the
+            # conversation, which keeps threading correct).
+            conv_id = str(
+                meta.get("conversation_id")
+                or self._sms_conversation.get(str(chat_id))
+                or ""
+            ).strip()
+            to_number = ""
+            if not conv_id:
+                to_number = str(meta.get("to_phone") or chat_id).strip()
+                if not to_number.startswith("+"):
+                    # chat_id is a contact UUID (or unknown shape) — look up the
+                    # primary phone number on the contact record.
+                    to_number = await asyncio.to_thread(self._lookup_contact_phone, chat_id)
+                    if not to_number:
+                        return SendResult(
+                            success=False,
+                            error=f"No phone number on contact {chat_id}",
+                        )
             try:
-                msg = await asyncio.to_thread(identity.send_text, to=to_number, text=content)
+                if conv_id:
+                    msg = await asyncio.to_thread(
+                        identity.send_text, conversation_id=conv_id, text=content,
+                    )
+                else:
+                    msg = await asyncio.to_thread(
+                        identity.send_text, to=to_number, text=content,
+                    )
                 raw_response = _text_message_metadata(msg, mode="sms")
                 logger.info(
                     "[Inkbox] SMS queued to %s: id=%s delivery_status=%s",
-                    redact_phone(to_number),
+                    f"conversation={conv_id}" if conv_id else redact_phone(to_number),
                     raw_response.get("message_id") or "",
                     raw_response.get("delivery_status") or raw_response.get("status") or "",
                 )
@@ -1537,7 +1576,7 @@ class InkboxAdapter(BasePlatformAdapter):
                     raw_response=raw_response,
                 )
             except Exception as exc:
-                return _sms_send_failure(exc, to_number=to_number)
+                return _sms_send_failure(exc, to_number=to_number or conv_id)
 
         if mode == "email":
             to_addr = (meta.get("to_email") or "").strip()
@@ -1868,19 +1907,36 @@ class InkboxAdapter(BasePlatformAdapter):
         message_type: MessageType = MessageType.TEXT,
         media_urls: Optional[list[str]] = None,
         media_types: Optional[list[str]] = None,
+        conversation_id: Optional[str] = None,
+        is_group: bool = False,
+        participants: Optional[list] = None,
+        local_number: Optional[str] = None,
     ) -> MessageEvent:
         source = self.build_source(
             chat_id=str(chat_id),
             chat_name=contact_name or remote,
-            chat_type="dm",
-            user_id=str(chat_id),
+            chat_type="group" if is_group else "dm",
+            user_id=(contact["id"] if contact and contact.get("id") else remote),
             user_name=contact_name or remote,
             user_id_alt=remote,
+            chat_topic="group_sms" if is_group else None,
             message_id=text_id,
         )
         if text is None:
             contact_block = self._contact_marker(contact)
-            text = f"[inkbox:sms from={remote} | {contact_block}]\n{body}"
+            if is_group:
+                marker_parts = [
+                    f"[inkbox:group_sms conversation_id={conversation_id or 'unknown'}",
+                    f"from={remote}",
+                    f"local={local_number}" if local_number else None,
+                    f"participants={','.join(participants)}" if participants else None,
+                    "reply_mode=conversation_id",
+                    f"| {contact_block}]",
+                ]
+                marker = " ".join(p for p in marker_parts if p)
+                text = "\n".join([marker, GROUP_SMS_POLICY, body])
+            else:
+                text = f"[inkbox:sms from={remote} | {contact_block}]\n{body}"
         return MessageEvent(
             text=text,
             message_type=message_type,
@@ -1897,7 +1953,11 @@ class InkboxAdapter(BasePlatformAdapter):
         if event.message_type != MessageType.TEXT:
             return None
         text = (event.text or "").lstrip()
-        if text.startswith("[inkbox:sms ") or text.startswith("[inkbox:sms_burst "):
+        if (
+            text.startswith("[inkbox:sms ")
+            or text.startswith("[inkbox:sms_burst ")
+            or text.startswith("[inkbox:group_sms ")
+        ):
             return {"mode": "queue", "merge_text": True}
         return None
 
@@ -2016,13 +2076,36 @@ class InkboxAdapter(BasePlatformAdapter):
         direction = str(text_msg.get("direction") or "").strip().lower()
         if direction and direction != "inbound":
             return web.Response(status=200, text="ok")
+        # ``sender_phone_number`` is the actual author (differs from the 1:1
+        # peer in a group); fall back to ``remote_phone_number`` for 1:1.
+        sender = (text_msg.get("sender_phone_number") or "").strip()
         remote = (text_msg.get("remote_phone_number") or "").strip()
-        if not remote:
+        author = sender or remote
+        if not author:
             return web.Response(status=200, text="ok")
 
-        contact = await self._resolve_contact_full(kind="phone", value=remote)
-        chat_id = (contact["id"] if contact else remote)
+        conversation_id = str(text_msg.get("conversation_id") or "").strip()
+        data = envelope.get("data") or {}
+        # Group when the conversation says so, or when the webhook matched more
+        # than one remote party / agent identity.
+        is_group, participants = await self._resolve_sms_conversation(conversation_id)
+        if not is_group:
+            if len(data.get("contacts") or []) > 1 or len(data.get("agent_identities") or []) > 1:
+                is_group = True
+            elif len(text_msg.get("recipients") or []) > 1:
+                is_group = True
+
+        # Resolve the AUTHOR's contact (group) / peer's contact (1:1).
+        contact = await self._resolve_contact_full(kind="phone", value=author)
         contact_name = contact["name"] if contact and contact.get("name") else None
+
+        # Group chats are keyed by conversation UUID so every participant's
+        # messages share one session; 1:1 stays keyed on the contact.
+        if is_group and conversation_id:
+            chat_id = conversation_id
+        else:
+            chat_id = (contact["id"] if contact else author)
+
         raw_body = text_msg.get("text") or ""
         body = raw_body
         media_urls, media_types, media_markers = _extract_text_media(text_msg)
@@ -2035,42 +2118,42 @@ class InkboxAdapter(BasePlatformAdapter):
             logger.info(
                 "[Inkbox] SMS control '%s' from %s handled as protocol text",
                 control_word.upper(),
-                redact_phone(remote),
+                redact_phone(author),
             )
             return web.Response(status=200, text="ok")
 
         self._last_inbound_modality[str(chat_id)] = "sms"
+        if conversation_id:
+            self._sms_conversation[str(chat_id)] = conversation_id
+
+        local_number = (text_msg.get("local_phone_number") or "").strip() or None
+        common = dict(
+            envelope=envelope,
+            text_id=text_id,
+            remote=author,
+            contact=contact,
+            chat_id=chat_id,
+            contact_name=contact_name,
+            timestamp=timestamp,
+            media_urls=media_urls,
+            media_types=media_types,
+            conversation_id=conversation_id or None,
+            is_group=is_group,
+            participants=participants,
+            local_number=local_number,
+        )
 
         if raw_body.lstrip().startswith("/"):
             event = self._build_sms_text_event(
-                envelope=envelope,
-                text_id=text_id,
-                remote=remote,
-                contact=contact,
-                chat_id=chat_id,
-                contact_name=contact_name,
                 body=body,
-                timestamp=timestamp,
                 text=raw_body.strip(),
                 message_type=MessageType.COMMAND,
-                media_urls=media_urls,
-                media_types=media_types,
+                **common,
             )
             await self._enqueue(event)
             return web.Response(status=200, text="ok")
 
-        event = self._build_sms_text_event(
-            envelope=envelope,
-            text_id=text_id,
-            remote=remote,
-            contact=contact,
-            chat_id=chat_id,
-            contact_name=contact_name,
-            body=body,
-            timestamp=timestamp,
-            media_urls=media_urls,
-            media_types=media_types,
-        )
+        event = self._build_sms_text_event(body=body, **common)
         await self._enqueue_sms_text_event(event)
         return web.Response(status=200, text="ok")
 
@@ -2797,6 +2880,41 @@ class InkboxAdapter(BasePlatformAdapter):
             )
 
     # ------------------------------------------------------------------
+
+    async def _resolve_sms_conversation(
+        self, conversation_id: str,
+    ) -> Tuple[bool, list]:
+        """Return ``(is_group, participants)`` for a text conversation UUID.
+
+        Looks the conversation up in ``list_text_conversations()`` and caches
+        the result briefly. Returns ``(False, [])`` when the SDK is
+        unavailable or the conversation isn't found (treat as 1:1).
+        """
+        conv = (conversation_id or "").strip()
+        if not conv or self._inkbox is None:
+            return (False, [])
+        cached = self._sms_conv_summary.get(conv)
+        if cached and cached[0] > time.time():
+            return (cached[1], cached[2])
+        is_group, participants = False, []
+        try:
+            identity = await asyncio.to_thread(
+                self._inkbox.get_identity, self._identity_handle,
+            )
+            summaries = await asyncio.to_thread(
+                identity.list_text_conversations, limit=50, offset=0,
+            )
+            for summary in summaries or []:
+                if str(getattr(summary, "id", "") or "") == conv:
+                    is_group = bool(getattr(summary, "is_group", False))
+                    participants = list(getattr(summary, "participants", None) or [])
+                    break
+        except Exception as exc:
+            logger.debug("[Inkbox] conversation summary lookup failed: %s", exc)
+        self._sms_conv_summary[conv] = (
+            time.time() + SMS_CONV_SUMMARY_TTL, is_group, participants,
+        )
+        return (is_group, participants)
 
     async def _resolve_contact(
         self, *, kind: str, value: str,
