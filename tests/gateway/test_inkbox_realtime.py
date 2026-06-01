@@ -22,14 +22,18 @@ from gateway.platforms.inkbox_realtime import (
     AGENT_CONSULT_TOOL_NAME,
     AUDIO_FORMAT_TELEPHONY,
     DEFAULT_MODEL,
+    DEFAULT_VOICE,
     POST_CALL_ACTION_TOOL_NAME,
     RealtimeCallMeta,
     RealtimeConfig,
     _BridgeState,
     _agent_consult_tool_schema,
     _dispatch_tool_call,
+    _maybe_send_greeting,
     _post_call_action_tool_schema,
+    _resolve_realtime_bearer,
     _send_session_update,
+    build_realtime_greeting,
     build_realtime_instructions,
 )
 
@@ -110,6 +114,17 @@ class TestBuildInstructions:
         # Outbound calls must include the directive not to offer generic help
         assert "do not open with a generic offer" in text
 
+    def test_outbound_call_includes_reason_scheduled_by_summary(self):
+        text = build_realtime_instructions(_meta(
+            direction="outbound",
+            outbound_reason="Follow up on the overdue invoice",
+            outbound_scheduled_by="the billing workflow",
+            outbound_conversation_summary="Customer promised to pay by Friday.",
+        ))
+        assert "Follow up on the overdue invoice" in text
+        assert "the billing workflow" in text
+        assert "Customer promised to pay by Friday." in text
+
     def test_inbound_call_does_not_include_outbound_directives(self):
         text = build_realtime_instructions(_meta(direction="inbound"))
         assert "do not open with a generic offer" not in text
@@ -127,12 +142,129 @@ class TestBuildInstructions:
         assert POST_CALL_ACTION_TOOL_NAME in text
 
 
+# ─── greeting ──────────────────────────────────────────────────────────────
+
+
+class TestGreeting:
+    def test_default_voice_is_cedar(self):
+        assert DEFAULT_VOICE == "cedar"
+
+    def test_inbound_greeting_uses_first_name(self):
+        g = build_realtime_greeting(_meta(contact_name="Alex Wilcox"))
+        assert "Alex" in g
+        assert "Wilcox" not in g
+
+    def test_inbound_greeting_unknown_contact_has_no_name(self):
+        g = build_realtime_greeting(_meta(contact_name="unknown"))
+        assert "Greet the caller" in g
+
+    def test_outbound_greeting_prefers_opening_message(self):
+        g = build_realtime_greeting(_meta(
+            direction="outbound",
+            outbound_opening="Hi, calling about your order.",
+        ))
+        assert "Hi, calling about your order." in g
+
+    def test_outbound_greeting_falls_back_to_purpose(self):
+        g = build_realtime_greeting(_meta(
+            direction="outbound",
+            outbound_purpose="confirm the appointment",
+        ))
+        assert "confirm the appointment" in g
+
+    @pytest.mark.asyncio
+    async def test_maybe_send_greeting_fires_once(self):
+        ws = _FakeWS()
+        state = _BridgeState()
+        await _maybe_send_greeting(ws, state, _meta())
+        await _maybe_send_greeting(ws, state, _meta())  # second call is a no-op
+        assert len(ws.sent) == 1
+        assert ws.sent[0]["type"] == "response.create"
+        assert ws.sent[0]["response"]["output_modalities"] == ["audio"]
+        assert state.greeting_triggered is True
+
+
+# ─── bearer resolution (api key vs OAuth client-secret mint) ────────────────
+
+
+class _FakePostCtx:
+    def __init__(self, status, payload):
+        self._status = status
+        self._payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    @property
+    def status(self):
+        return self._status
+
+    async def json(self):
+        return self._payload
+
+    async def text(self):
+        return json.dumps(self._payload)
+
+
+class _FakeSession:
+    def __init__(self, status=200, payload=None):
+        self.status = status
+        self.payload = payload or {}
+        self.calls = []
+
+    def post(self, url, headers=None, json=None):
+        self.calls.append({"url": url, "headers": headers, "json": json})
+        return _FakePostCtx(self.status, self.payload)
+
+
+class TestBearerResolution:
+    @pytest.mark.asyncio
+    async def test_api_key_used_directly_no_mint(self):
+        sess = _FakeSession()
+        cfg = RealtimeConfig(enabled=True, api_key="sk-direct")
+        bearer = await _resolve_realtime_bearer(sess, cfg)
+        assert bearer == "sk-direct"
+        assert sess.calls == []  # no mint call when api_key present
+
+    @pytest.mark.asyncio
+    async def test_oauth_mints_client_secret(self):
+        sess = _FakeSession(status=200, payload={"value": "ek-ephemeral"})
+        cfg = RealtimeConfig(enabled=True, oauth_token="oauth-tok", model="gpt-realtime-2")
+        bearer = await _resolve_realtime_bearer(sess, cfg)
+        assert bearer == "ek-ephemeral"
+        assert len(sess.calls) == 1
+        assert sess.calls[0]["headers"]["Authorization"] == "Bearer oauth-tok"
+        assert sess.calls[0]["json"]["session"]["type"] == "realtime"
+
+    @pytest.mark.asyncio
+    async def test_oauth_mint_nested_client_secret_value(self):
+        sess = _FakeSession(status=200, payload={"client_secret": {"value": "ek-nested"}})
+        cfg = RealtimeConfig(enabled=True, oauth_token="oauth-tok")
+        bearer = await _resolve_realtime_bearer(sess, cfg)
+        assert bearer == "ek-nested"
+
+    @pytest.mark.asyncio
+    async def test_oauth_mint_http_error_raises(self):
+        sess = _FakeSession(status=401, payload={"error": "bad token"})
+        cfg = RealtimeConfig(enabled=True, oauth_token="oauth-tok")
+        with pytest.raises(RuntimeError):
+            await _resolve_realtime_bearer(sess, cfg)
+
+    def test_has_credential_property(self):
+        assert RealtimeConfig(api_key="sk-x").has_credential is True
+        assert RealtimeConfig(oauth_token="tok").has_credential is True
+        assert RealtimeConfig().has_credential is False
+
+
 # ─── GA session.update protocol ────────────────────────────────────────────
 
 
 class TestSessionUpdate:
     def test_default_model_is_ga_v2(self):
-        # We default to the GA gpt-realtime-2 model (matches openclaw-core).
+        # We default to the GA gpt-realtime-2 model.
         assert DEFAULT_MODEL == "gpt-realtime-2"
 
     def test_telephony_audio_format_is_ga_object(self):
@@ -376,7 +508,7 @@ class TestDispatchUnknownTool:
 
 
 class TestAdapterRealtimeConfig:
-    def _make(self, monkeypatch, extra_overrides=None):
+    def _make(self, monkeypatch, extra_overrides=None, codex_token=""):
         # Reuse the same _patch_sdk helper used by the broader inkbox test
         # suite so we don't double-mock the SDK here.
         from tests.gateway.test_inkbox import _patch_sdk
@@ -384,6 +516,9 @@ class TestAdapterRealtimeConfig:
         from gateway.platforms.inkbox import InkboxAdapter
 
         _patch_sdk(monkeypatch)
+        # Stub the Codex OAuth token lookup so tests don't read real auth.json.
+        import hermes_cli.auth as _auth
+        monkeypatch.setattr(_auth, "_pool_codex_access_token", lambda: codex_token)
         cfg = PlatformConfig(
             enabled=True,
             api_key="ApiKey_test",
@@ -405,7 +540,7 @@ class TestAdapterRealtimeConfig:
         assert adapter._realtime_config.enabled is False
 
     def test_realtime_auto_enables_on_openai_key(self, monkeypatch):
-        # Auto-detect (OpenClaw parity): a generic OPENAI_API_KEY with NO
+        # Auto-detect: a generic OPENAI_API_KEY with NO
         # explicit flag turns realtime on.
         monkeypatch.delenv("INKBOX_REALTIME_ENABLED", raising=False)
         monkeypatch.delenv("INKBOX_REALTIME_API_KEY", raising=False)
@@ -436,15 +571,33 @@ class TestAdapterRealtimeConfig:
         assert adapter._realtime_config.enabled is True
         assert adapter._realtime_config.api_key == "sk-test-abc"
 
-    def test_realtime_explicit_enable_without_api_key_falls_back(self, monkeypatch):
-        # enabled=true but no API key — must not crash; bridge stays disabled
-        # so calls fall back to the text path.
+    def test_realtime_explicit_enable_without_any_credential_falls_back(self, monkeypatch):
+        # enabled=true but no API key AND no Codex OAuth — stays disabled.
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("INKBOX_REALTIME_API_KEY", raising=False)
         adapter = self._make(monkeypatch, extra_overrides={
             "realtime": {"enabled": True},
-        })
+        }, codex_token="")
         assert adapter._realtime_config.enabled is False
+
+    def test_realtime_auto_enables_on_codex_oauth(self, monkeypatch):
+        # No sk- key but the agent has a Codex OAuth token -> realtime on,
+        # oauth_token populated (the "proper OpenAI method" path).
+        monkeypatch.delenv("INKBOX_REALTIME_ENABLED", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("INKBOX_REALTIME_API_KEY", raising=False)
+        adapter = self._make(monkeypatch, codex_token="codex-oauth-token")
+        assert adapter._realtime_config.enabled is True
+        assert adapter._realtime_config.api_key == ""
+        assert adapter._realtime_config.oauth_token == "codex-oauth-token"
+
+    def test_realtime_api_key_preferred_over_codex_oauth(self, monkeypatch):
+        monkeypatch.delenv("INKBOX_REALTIME_ENABLED", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-wins")
+        adapter = self._make(monkeypatch, codex_token="codex-oauth-token")
+        assert adapter._realtime_config.api_key == "sk-wins"
+        # When an API key is present we don't bother reading the OAuth token.
+        assert adapter._realtime_config.oauth_token == ""
 
     def test_config_extras_take_precedence_over_env(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-env")

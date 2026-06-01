@@ -25,7 +25,7 @@ The bridge:
      ends, all queued actions are dispatched as a single synthetic SMS-mode
      turn so the main agent can execute them (send email, create note, etc.).
 
-The shape mirrors ``inkbox-ai/openclaw-plugin``'s ``RealtimeCallWebSocket``.
+The bridge owns the OpenAI Realtime WebSocket for the duration of one call.
 """
 
 from __future__ import annotations
@@ -46,14 +46,19 @@ except ImportError:  # pragma: no cover — aiohttp is a core dep on this fork
 logger = logging.getLogger(__name__)
 
 REALTIME_URL = "wss://api.openai.com/v1/realtime"
-# GA Realtime model. Matches openclaw-core's
-# extensions/openai/realtime-voice-provider.ts OPENAI_REALTIME_DEFAULT_MODEL.
-# The GA models (gpt-realtime, gpt-realtime-2) use the *nested* session
+# GA Realtime model. The GA models (gpt-realtime, gpt-realtime-2) use the
+# *nested* session
 # schema (audio.input / audio.output) — NOT the older flat
 # input_audio_format / output_audio_format shape used by the beta
 # gpt-4o-realtime-preview models. See _send_session_update.
 DEFAULT_MODEL = "gpt-realtime-2"
-DEFAULT_VOICE = "alloy"
+# "cedar" and "marin" are the recommended high-quality GA Realtime voices.
+DEFAULT_VOICE = "cedar"
+
+# OpenAI endpoint that exchanges an OAuth/ChatGPT access token for an
+# ephemeral Realtime client secret. Lets the bridge use the agent's existing
+# Codex/ChatGPT OAuth credentials instead of requiring a separate sk- API key.
+REALTIME_CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
 # Telephony audio is G.711 μ-law @ 8 kHz. The GA session schema expects an
 # audio-format *object*, not the legacy "g711_ulaw" string.
 AUDIO_FORMAT_TELEPHONY = {"type": "audio/pcmu"}
@@ -152,6 +157,13 @@ class RealtimeCallMeta:
     agent_identity_phone: Optional[str] = None
     outbound_purpose: Optional[str] = None
     outbound_opening: Optional[str] = None
+    # Richer outbound-call context loaded from the call-context file
+    # (``$HERMES_HOME/inkbox_call_contexts/<token>.json``). These are the
+    # keys the legacy text-mode call handler reads, so realtime calls keep
+    # the same "why we called" continuity.
+    outbound_reason: Optional[str] = None
+    outbound_scheduled_by: Optional[str] = None
+    outbound_conversation_summary: Optional[str] = None
 
 
 @dataclass
@@ -163,13 +175,24 @@ class RealtimeConfig:
     """
 
     enabled: bool = False
+    # Standard OpenAI Platform API key (sk-...). Used directly as the WS
+    # bearer when present.
     api_key: str = ""
+    # ChatGPT/Codex OAuth access token. When there's no api_key, this is
+    # exchanged for an ephemeral Realtime client secret (see
+    # _resolve_realtime_bearer). Lets the agent's existing Codex login drive
+    # realtime without a separate API key.
+    oauth_token: str = ""
     model: str = DEFAULT_MODEL
     voice: str = DEFAULT_VOICE
     additional_instructions: str = ""
     consult_timeout_s: float = DEFAULT_CONSULT_TIMEOUT_S
     # ``api.openai.com`` by default; override for Azure / proxies.
     base_url: str = REALTIME_URL
+
+    @property
+    def has_credential(self) -> bool:
+        return bool(self.api_key or self.oauth_token)
 
 
 @dataclass
@@ -185,6 +208,7 @@ class _BridgeState:
     post_call_actions: List[Dict[str, str]] = field(default_factory=list)
     last_response_id: Optional[str] = None
     closed: bool = False
+    greeting_triggered: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,9 +222,8 @@ def build_realtime_instructions(
 ) -> str:
     """Compose the system prompt sent to the realtime model.
 
-    Mirrors openclaw's ``buildRealtimeInstructions`` — gives the model a clear
-    identity, caller context, when to call the two tools, and a directive to
-    keep replies short and spoken-friendly.
+    Gives the model a clear identity, caller context, when to call the two
+    tools, and a directive to keep replies short and spoken-friendly.
     """
     lines: List[str] = [
         "You are the configured Hermes agent speaking on a live Inkbox phone call.",
@@ -222,6 +245,15 @@ def build_realtime_instructions(
     if meta.direction == "outbound":
         if meta.outbound_purpose:
             lines.append(f"This is an outbound call you placed. Purpose: {meta.outbound_purpose}")
+        if meta.outbound_reason:
+            lines.append(f"Reason for the call: {meta.outbound_reason}")
+        if meta.outbound_scheduled_by:
+            lines.append(f"This call was scheduled by: {meta.outbound_scheduled_by}")
+        if meta.outbound_conversation_summary:
+            lines.append(
+                f"Summary of the prior conversation that led to this call:\n"
+                f"{meta.outbound_conversation_summary}",
+            )
         if meta.outbound_opening:
             lines.append(
                 f"Preferred opening message (say this naturally as your first turn): "
@@ -245,6 +277,42 @@ def build_realtime_instructions(
     if additional_instructions.strip():
         lines.append(additional_instructions.strip())
     return "\n".join(lines)
+
+
+def build_realtime_greeting(meta: RealtimeCallMeta) -> str:
+    """Build the instruction for the proactive opening line.
+
+    Realtime calls must not start with silence — the model should greet first.
+    Inbound: a short friendly greeting. Outbound: lead with the configured
+    opening message / purpose so the callee immediately knows why we called.
+    """
+    first_name = ""
+    if meta.contact_name and meta.contact_name not in ("unknown", ""):
+        first_name = meta.contact_name.split()[0]
+
+    if meta.direction == "outbound":
+        if meta.outbound_opening:
+            return (
+                "Open the call by saying this naturally as the very first thing, "
+                "with no greeting before it:\n" + meta.outbound_opening
+            )
+        if meta.outbound_purpose:
+            return (
+                "Open the call by greeting the person and immediately explaining "
+                f"why you are calling: {meta.outbound_purpose}"
+            )
+        return (
+            "Open the call by greeting the person and explaining why you are "
+            "calling. Be specific and concise."
+        )
+
+    # Inbound.
+    who = f" {first_name}" if first_name else ""
+    return (
+        f"Greet the caller now as the very first thing you say. Say something "
+        f"like 'Hi{who}, this is your Hermes agent — how can I help?' Keep it to "
+        f"one short sentence and then wait for them to respond."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,21 +357,25 @@ async def run_inkbox_realtime_bridge(
     if aiohttp is None:
         logger.error("[Inkbox realtime] aiohttp not available; cannot open Realtime API WS")
         return
-    if not config.api_key:
-        logger.error("[Inkbox realtime] No OpenAI API key configured; refusing to bridge")
+    if not config.has_credential:
+        logger.error("[Inkbox realtime] No OpenAI credential (api_key or oauth_token); refusing to bridge")
         return
 
     state = _BridgeState()
     url = f"{config.base_url}?model={config.model}"
-    # GA Realtime API does not require the ``OpenAI-Beta: realtime=v1`` header
-    # that the beta gpt-4o-realtime-preview models used. openclaw-core's GA
-    # path omits it; we match.
-    headers = {
-        "Authorization": f"Bearer {config.api_key}",
-    }
 
     session = aiohttp.ClientSession()
     try:
+        try:
+            bearer = await _resolve_realtime_bearer(session, config)
+        except Exception as exc:
+            logger.error("[Inkbox realtime] Could not resolve OpenAI bearer: %s", exc)
+            return
+        if not bearer:
+            return
+
+        # GA Realtime drops the OpenAI-Beta: realtime=v1 header.
+        headers = {"Authorization": f"Bearer {bearer}"}
         try:
             openai_ws = await session.ws_connect(url, headers=headers, heartbeat=30)
         except Exception as exc:
@@ -314,7 +386,7 @@ async def run_inkbox_realtime_bridge(
             await _send_session_update(openai_ws, config, meta)
             # Two concurrent pumps:
             inkbox_task = asyncio.create_task(
-                _inkbox_to_openai_pump(inkbox_ws, openai_ws, state),
+                _inkbox_to_openai_pump(inkbox_ws, openai_ws, state, meta),
                 name=f"realtime-inkbox-pump-{meta.call_id}",
             )
             openai_task = asyncio.create_task(
@@ -364,6 +436,62 @@ async def run_inkbox_realtime_bridge(
         await session.close()
 
 
+async def _resolve_realtime_bearer(
+    session: Any, config: RealtimeConfig,
+) -> str:
+    """Return the bearer to use on the Realtime WS.
+
+    Prefers a standard ``sk-`` API key. Otherwise exchanges the ChatGPT/Codex
+    OAuth token for an ephemeral Realtime client secret.
+    """
+    if config.api_key:
+        return config.api_key
+
+    body = {
+        "session": {
+            "type": "realtime",
+            "model": config.model,
+            "audio": {"output": {"voice": config.voice}},
+        },
+    }
+    headers = {
+        "Authorization": f"Bearer {config.oauth_token}",
+        "Content-Type": "application/json",
+    }
+    async with session.post(
+        REALTIME_CLIENT_SECRETS_URL, headers=headers, json=body,
+    ) as resp:
+        if resp.status >= 400:
+            detail = (await resp.text())[:200]
+            raise RuntimeError(f"client_secrets HTTP {resp.status}: {detail}")
+        data = await resp.json()
+    secret = data.get("value")
+    if not secret and isinstance(data.get("client_secret"), dict):
+        secret = data["client_secret"].get("value")
+    if not secret:
+        raise RuntimeError("client_secrets response had no value")
+    return str(secret)
+
+
+async def _maybe_send_greeting(
+    openai_ws: Any, state: _BridgeState, meta: RealtimeCallMeta,
+) -> None:
+    """Fire the proactive opening line once, so calls don't start with silence."""
+    if state.greeting_triggered:
+        return
+    state.greeting_triggered = True
+    try:
+        await openai_ws.send_str(json.dumps({
+            "type": "response.create",
+            "response": {
+                "output_modalities": ["audio"],
+                "instructions": build_realtime_greeting(meta),
+            },
+        }))
+    except Exception as exc:
+        logger.debug("[Inkbox realtime] greeting send failed: %s", exc)
+
+
 async def _send_session_update(
     openai_ws: Any, config: RealtimeConfig, meta: RealtimeCallMeta,
 ) -> None:
@@ -373,7 +501,7 @@ async def _send_session_update(
     nested ``audio.input`` / ``audio.output``) required by gpt-realtime /
     gpt-realtime-2. The legacy flat ``input_audio_format`` / ``modalities``
     shape is only accepted by the older beta preview models and would be
-    rejected by GA. Mirrors openclaw-core ``buildGaSessionUpdate``.
+    rejected by GA.
     """
     instructions = build_realtime_instructions(meta, config.additional_instructions)
     payload = {
@@ -416,15 +544,14 @@ async def _send_session_update(
 
 
 async def _inkbox_to_openai_pump(
-    inkbox_ws: Any, openai_ws: Any, state: _BridgeState,
+    inkbox_ws: Any, openai_ws: Any, state: _BridgeState, meta: RealtimeCallMeta,
 ) -> None:
-    """Forward caller audio frames from Inkbox to the OpenAI Realtime session.
+    """Forward caller audio from Inkbox to OpenAI; fire the opening greeting.
 
-    Inkbox sends each audio frame as a JSON message of the form
-    ``{"event": "media", "media": {"payload": "<base64-mulaw>"}}`` over the
-    accepted WebSocket. We unwrap and re-emit as
-    ``input_audio_buffer.append`` events. With server-side VAD enabled, the
-    realtime model auto-detects speech boundaries.
+    Inkbox sends frames as ``{"event": "media", "media": {"payload": "<b64>"}}``.
+    We re-emit as ``input_audio_buffer.append``; server-side VAD handles turns.
+    The proactive greeting fires once on the ``start`` event, or on first media
+    if no ``start`` is sent.
     """
     async for msg in inkbox_ws:
         if state.closed:
@@ -435,7 +562,11 @@ async def _inkbox_to_openai_pump(
             except (TypeError, ValueError):
                 continue
             event = (frame.get("event") or "").lower()
-            if event == "media":
+            if event == "start":
+                await _maybe_send_greeting(openai_ws, state, meta)
+            elif event == "media":
+                if not state.greeting_triggered:
+                    await _maybe_send_greeting(openai_ws, state, meta)
                 payload_b64 = (frame.get("media") or {}).get("payload")
                 if payload_b64:
                     await openai_ws.send_str(json.dumps({
@@ -445,8 +576,6 @@ async def _inkbox_to_openai_pump(
             elif event in {"stop", "closed", "hangup"}:
                 logger.info("[Inkbox realtime] Inkbox WS signaled %s", event)
                 return
-            # Other Inkbox event types ("start", "mark", ...) are ignored —
-            # they're book-keeping for the Inkbox side, not for the model.
         elif msg.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
             return
 
@@ -679,8 +808,7 @@ async def _submit_tool_result(
             },
         }))
         # Bare response.create — let the session's configured output
-        # modalities + audio settings apply. Matches openclaw-core's
-        # ``sendEvent({ type: "response.create" })``. Passing a beta-style
+        # modalities + audio settings apply. Passing a beta-style
         # ``modalities`` field here would be rejected by GA models.
         await openai_ws.send_str(json.dumps({
             "type": "response.create",

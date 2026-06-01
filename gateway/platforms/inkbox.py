@@ -76,6 +76,7 @@ import re
 import socket as _socket
 import time
 from contextlib import suppress
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
@@ -892,8 +893,7 @@ class InkboxAdapter(BasePlatformAdapter):
         # bridged to OpenAI's Realtime API instead of relying on
         # Inkbox-side STT/TTS. See :mod:`gateway.platforms.inkbox_realtime`.
         #
-        # Enablement is tri-state, matching openclaw-core's "auto unless
-        # explicitly disabled" behavior:
+        # Enablement is tri-state ("auto unless explicitly disabled"):
         #   - explicit false (realtime.enabled=false / INKBOX_REALTIME_ENABLED=false)
         #     -> OFF, always.
         #   - explicit true  -> ON if an OpenAI key is present; warn + fall back
@@ -923,31 +923,41 @@ class InkboxAdapter(BasePlatformAdapter):
             or os.getenv("INKBOX_REALTIME_API_KEY", "").strip()
             or os.getenv("OPENAI_API_KEY", "").strip()
         )
+        # No sk- key? Fall back to the agent's ChatGPT/Codex OAuth token, which
+        # the bridge exchanges for an ephemeral Realtime client secret.
+        rt_oauth_token = ""
+        if not rt_api_key:
+            try:
+                from hermes_cli.auth import _pool_codex_access_token
+                rt_oauth_token = (_pool_codex_access_token() or "").strip()
+            except Exception:
+                rt_oauth_token = ""
+        rt_has_cred = bool(rt_api_key or rt_oauth_token)
 
         if rt_setting is False:
             rt_enabled = False
         elif rt_setting is True:
-            # Explicitly requested — needs a key to actually run.
-            rt_enabled = bool(rt_api_key)
-            if not rt_api_key:
+            rt_enabled = rt_has_cred
+            if not rt_has_cred:
                 logger.warning(
                     "[Inkbox] realtime voice was explicitly enabled but no OpenAI "
-                    "API key was found (checked realtime.api_key, "
-                    "INKBOX_REALTIME_API_KEY, OPENAI_API_KEY); falling back to "
-                    "Inkbox-side STT/TTS for calls.",
+                    "credential was found (checked realtime.api_key, "
+                    "INKBOX_REALTIME_API_KEY, OPENAI_API_KEY, Codex OAuth); falling "
+                    "back to Inkbox-side STT/TTS for calls.",
                 )
         else:
-            # Unset -> auto-detect: on whenever an OpenAI key is available.
-            rt_enabled = bool(rt_api_key)
+            rt_enabled = rt_has_cred
             if rt_enabled:
                 logger.info(
-                    "[Inkbox] realtime voice auto-enabled (OpenAI key present; "
-                    "set INKBOX_REALTIME_ENABLED=false to disable).",
+                    "[Inkbox] realtime voice auto-enabled (%s present; set "
+                    "INKBOX_REALTIME_ENABLED=false to disable).",
+                    "API key" if rt_api_key else "Codex OAuth",
                 )
 
         self._realtime_config = RealtimeConfig(
             enabled=rt_enabled,
             api_key=rt_api_key,
+            oauth_token=rt_oauth_token,
             model=str(rt_extra.get("model") or os.getenv("INKBOX_REALTIME_MODEL") or REALTIME_DEFAULT_MODEL),
             voice=str(rt_extra.get("voice") or os.getenv("INKBOX_REALTIME_VOICE") or REALTIME_DEFAULT_VOICE),
             additional_instructions=str(rt_extra.get("additional_instructions") or ""),
@@ -2286,14 +2296,8 @@ class InkboxAdapter(BasePlatformAdapter):
 
         # Realtime voice bridge — when configured, hand the WS off to the
         # OpenAI Realtime API bridge instead of the legacy text-event flow
-        # below. The bridge owns the WS lifecycle until call end; on return
-        # we run the post-call cleanup and return the WS response.
-        #
-        # NOTE: this branch MUST come after ``call_context`` is loaded above
-        # (it reads purpose/opening_message from it). Placing it earlier
-        # crashes the call because ``call_context`` would be the raw
-        # X-Call-Context header string (or unbound when signature
-        # verification is off).
+        # below. Must come after ``call_context`` is loaded (it reads the
+        # outbound-call keys from it).
         if self._realtime_config.enabled:
             try:
                 identity_for_meta = None
@@ -2322,10 +2326,26 @@ class InkboxAdapter(BasePlatformAdapter):
                     ) if identity_for_meta is not None else None,
                     outbound_purpose=str(call_context.get("purpose") or "") or None,
                     outbound_opening=str(call_context.get("opening_message") or "") or None,
+                    outbound_reason=str(call_context.get("reason") or "") or None,
+                    outbound_scheduled_by=str(call_context.get("scheduled_by") or "") or None,
+                    outbound_conversation_summary=str(
+                        call_context.get("conversation_summary") or "") or None,
                 )
+                # Refresh the Codex OAuth token per call (it expires/rotates);
+                # the cached __init__ value would go stale.
+                rt_config = self._realtime_config
+                if rt_config.enabled and not rt_config.api_key:
+                    fresh_token = ""
+                    try:
+                        from hermes_cli.auth import _pool_codex_access_token
+                        fresh_token = (_pool_codex_access_token() or "").strip()
+                    except Exception:
+                        fresh_token = rt_config.oauth_token
+                    if fresh_token:
+                        rt_config = replace(rt_config, oauth_token=fresh_token)
                 await run_inkbox_realtime_bridge(
                     inkbox_ws=ws,
-                    config=self._realtime_config,
+                    config=rt_config,
                     meta=rt_meta,
                     on_agent_consult=self._realtime_agent_consult,
                     on_post_call_actions=self._realtime_post_call_actions,
@@ -2648,8 +2668,8 @@ class InkboxAdapter(BasePlatformAdapter):
     ) -> None:
         """Dispatch queued post-call actions as a synthetic SMS-mode turn.
 
-        Mirrors openclaw's ``runRealtimePostCallActions``: build a single
-        synthetic inbound message containing all queued actions + recent
+        Build a single synthetic inbound message containing all queued
+        actions + recent
         transcript, push it through the normal inbound queue so the main
         agent executes them with its full toolset.
         """
