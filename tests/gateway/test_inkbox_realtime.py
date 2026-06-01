@@ -180,7 +180,8 @@ class TestGreeting:
         await _maybe_send_greeting(ws, state, _meta())  # second call is a no-op
         assert len(ws.sent) == 1
         assert ws.sent[0]["type"] == "response.create"
-        assert ws.sent[0]["response"]["output_modalities"] == ["audio"]
+        assert "output_modalities" not in ws.sent[0]["response"]
+        assert "instructions" in ws.sent[0]["response"]
         assert state.greeting_triggered is True
 
 

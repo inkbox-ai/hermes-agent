@@ -336,6 +336,15 @@ PostCallActionsCallback = Callable[
     Awaitable[None],
 ]
 
+# Called when the realtime call WebSocket has ended, regardless of whether the
+# model explicitly registered post-call actions. This mirrors the legacy
+# Inkbox STT/TTS path's [call_ended] reflection so commitments made during a
+# realtime call can still be followed up safely.
+CallEndedCallback = Callable[
+    [RealtimeCallMeta, List[Tuple[str, str]]],
+    Awaitable[None],
+]
+
 
 async def run_inkbox_realtime_bridge(
     *,
@@ -344,6 +353,7 @@ async def run_inkbox_realtime_bridge(
     meta: RealtimeCallMeta,
     on_agent_consult: AgentConsultCallback,
     on_post_call_actions: PostCallActionsCallback,
+    on_call_ended: CallEndedCallback,
 ) -> None:
     """Run the bridge for the duration of one call.
 
@@ -432,6 +442,13 @@ async def run_inkbox_realtime_bridge(
                 logger.warning(
                     "[Inkbox realtime] Post-call action dispatch failed: %s", exc,
                 )
+
+        try:
+            await on_call_ended(meta, list(state.transcript))
+        except Exception as exc:
+            logger.warning(
+                "[Inkbox realtime] Call-ended dispatch failed: %s", exc,
+            )
     finally:
         await session.close()
 
@@ -481,13 +498,17 @@ async def _maybe_send_greeting(
         return
     state.greeting_triggered = True
     try:
+        # No modalities field here — it inherits the session's
+        # output_modalities. Passing output_modalities inside response.create
+        # is rejected by GA models (it's a session-level field).
         await openai_ws.send_str(json.dumps({
             "type": "response.create",
-            "response": {
-                "output_modalities": ["audio"],
-                "instructions": build_realtime_greeting(meta),
-            },
+            "response": {"instructions": build_realtime_greeting(meta)},
         }))
+        logger.info(
+            "[Inkbox realtime] greeting sent for call_id=%s direction=%s",
+            meta.call_id, meta.direction,
+        )
     except Exception as exc:
         logger.debug("[Inkbox realtime] greeting send failed: %s", exc)
 
@@ -733,13 +754,13 @@ async def _dispatch_tool_call(
         # the model says "one moment" while the agent thinks. The final tool
         # result is what the model uses to compose the actual spoken answer.
         try:
-            # GA response.create uses ``output_modalities`` (not the beta
-            # ``modalities``). We override instructions for just this turn so
-            # the model says a short filler line while the agent runs.
+            # Override instructions for just this turn so the model says a
+            # short filler line while the agent runs. No modalities field —
+            # it inherits the session's output_modalities (GA rejects
+            # output_modalities inside response.create).
             await openai_ws.send_str(json.dumps({
                 "type": "response.create",
                 "response": {
-                    "output_modalities": ["audio"],
                     "instructions": (
                         "Say only 'One moment.' Do not mention waiting for "
                         "context or checking a lookup."

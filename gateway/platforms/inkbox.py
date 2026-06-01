@@ -78,7 +78,7 @@ import time
 from contextlib import suppress
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 try:
@@ -2349,6 +2349,7 @@ class InkboxAdapter(BasePlatformAdapter):
                     meta=rt_meta,
                     on_agent_consult=self._realtime_agent_consult,
                     on_post_call_actions=self._realtime_post_call_actions,
+                    on_call_ended=self._realtime_call_ended,
                 )
             except Exception as exc:
                 logger.warning(
@@ -2357,11 +2358,15 @@ class InkboxAdapter(BasePlatformAdapter):
                 )
             finally:
                 self._active_call_ws.pop(contact_id, None)
+                if self._last_inbound_modality.get(str(contact_id)) == "voice":
+                    self._last_inbound_modality.pop(str(contact_id), None)
+                self._voice_recently_closed[str(contact_id)] = time.time()
                 try:
                     if not ws.closed:
                         await ws.close()
                 except Exception:
                     pass
+                logger.info("[Inkbox] Call WS closed: call_id=%s", call_id)
             return ws
 
         async def _send_text_delta(text: str, *, turn_id: str) -> None:
@@ -2660,6 +2665,61 @@ class InkboxAdapter(BasePlatformAdapter):
             )
         return text
 
+    async def _realtime_call_ended(
+        self,
+        meta: RealtimeCallMeta,
+        transcript: List[Tuple[str, str]],
+    ) -> None:
+        """Enqueue the legacy [call_ended] reflection for realtime calls."""
+        transcript_block = "\n".join(
+            f"  - {role}: {text}" for role, text in transcript[-30:]
+        )
+        body_parts = [
+            f"[inkbox:voice_call call_id={meta.call_id}]",
+            "[call_ended] The realtime voice call has ended. Reflect on what just "
+            "happened and decide if any follow-up actions are needed:",
+            "  - if you committed to anything during the call (send an email, "
+            "schedule a callback, text a contact, save a note, update a contact "
+            "record), perform that now via tool calls.",
+            "  - if there's nothing to do, reply with exactly [SILENT] and no other text.",
+            "Note: any plain-text reply you produce here will be suppressed. "
+            "Side effects must come from tool calls.",
+        ]
+        if transcript_block:
+            body_parts.extend(["", "Recent realtime-call transcript:", transcript_block])
+        body = "\n".join(body_parts)
+        source = self.build_source(
+            chat_id=meta.contact_id,
+            chat_name=meta.contact_name,
+            chat_type="dm",
+            user_id=meta.contact_id,
+            user_name=meta.contact_name,
+            user_id_alt=meta.remote_phone_number,
+            thread_id=None if meta.direction == "outbound" else f"call:{meta.call_id}",
+            chat_topic="voice_call",
+            message_id=f"call:{meta.call_id}:ended",
+        )
+        event = MessageEvent(
+            text=body,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"event": "realtime_call_ended", "transcript": transcript},
+            message_id=f"call:{meta.call_id}:ended",
+            reply_to_message_id=meta.call_id,
+            auto_skill="inkbox",
+        )
+        try:
+            await self._enqueue(event)
+            logger.info(
+                "[Inkbox] Enqueued realtime [call_ended] reflection for call_id=%s",
+                meta.call_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Inkbox] realtime call_ended enqueue failed for call_id=%s: %s",
+                meta.call_id, exc,
+            )
+
     async def _realtime_post_call_actions(
         self,
         meta: RealtimeCallMeta,
@@ -2697,22 +2757,28 @@ class InkboxAdapter(BasePlatformAdapter):
             "Recent live-call transcript:" if transcript_block else "",
             transcript_block,
         ])
-        event = MessageEvent(
-            platform=Platform.INKBOX,
-            message_type=MessageType.TEXT,
-            user_id=meta.contact_id,
-            user_name=meta.contact_name,
+        source = self.build_source(
             chat_id=meta.contact_id,
             chat_name=meta.contact_name,
-            message_id=f"call:{meta.call_id}:post-call-actions",
-            message_text=body,
-            timestamp=time.time(),
-            reply_to_message_id=meta.call_id,
+            chat_type="dm",
+            user_id=meta.contact_id,
+            user_name=meta.contact_name,
+            user_id_alt=meta.remote_phone_number,
             thread_id=None if meta.direction == "outbound" else f"call:{meta.call_id}",
-            raw_event={
+            chat_topic="voice_call",
+            message_id=f"call:{meta.call_id}:post-call-actions",
+        )
+        event = MessageEvent(
+            text=body,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={
                 "event": "realtime_post_call_actions",
                 "actions": actions,
             },
+            message_id=f"call:{meta.call_id}:post-call-actions",
+            reply_to_message_id=meta.call_id,
+            auto_skill="inkbox",
         )
         try:
             await self._enqueue(event)
