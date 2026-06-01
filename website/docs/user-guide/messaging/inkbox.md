@@ -150,7 +150,7 @@ If realtime is explicitly enabled but no credential is found, the bridge falls b
 4. Model audio: OpenAI (`response.output_audio.delta`) → Hermes → Inkbox `media` frames tagged `track: "outbound"` with the `stream_id`. `response.output_audio.done` emits an `audio_done` frame; OpenAI `input_audio_buffer.speech_started` (caller barge-in) emits a `clear` frame to drop queued audio.
 5. The full resolved contact (name, emails, phones, company, notes) is loaded into the model's instructions at call start (only when a contact actually matched), so it knows who's calling without a mid-call lookup.
 6. Tool calls: accumulated by `item_id` (name from `response.output_item.added`, args from `response.function_call_arguments.delta/.done`, with `response.output_item.done` as a fallback), then dispatched once → adapter callback → `submitToolResult` via `conversation.item.create` + `response.create`.
-6. On `hermes_agent_consult`, the bridge fires an interim "Say only 'One moment.'" instruction so the model fills dead air while the spawned `hermes -z` invocation runs.
+7. On `hermes_agent_consult`, the bridge fires an interim "Say only 'One moment.'" instruction so the model fills dead air while the spawned `hermes -z` invocation runs.
 
 ### Limitations
 
