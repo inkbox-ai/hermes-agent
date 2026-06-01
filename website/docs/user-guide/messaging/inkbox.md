@@ -146,8 +146,9 @@ If realtime is explicitly enabled but no credential is found, the bridge falls b
 
 1. The call WS handler in `gateway/platforms/inkbox.py:_handle_call_ws` accepts the Inkbox WebSocket with `x-use-inkbox-text-to-speech: false` and `x-use-inkbox-speech-to-text: false` so Inkbox forwards raw μ-law frames.
 2. `gateway/platforms/inkbox_realtime.py:run_inkbox_realtime_bridge` opens a WS to `wss://api.openai.com/v1/realtime?model=<model>` with the API key, sends the **GA-schema** `session.update` (nested `audio.input` / `audio.output`, `output_modalities: ["audio"]`, audio format object `{"type": "audio/pcmu"}`) required by the GA models, and starts two concurrent pumps. The legacy flat `input_audio_format` shape used by the older `gpt-4o-realtime-preview` beta models is **not** sent — GA rejects it.
-3. Caller audio: Inkbox → Hermes (μ-law base64 in `media` events) → OpenAI (`input_audio_buffer.append`).
-4. Model audio: OpenAI (`response.output_audio.delta`, or `response.audio.delta` on older models — both handled) → Hermes → Inkbox (`media` events).
+3. Caller audio: Inkbox → Hermes (μ-law base64 in `media` events) → OpenAI (`input_audio_buffer.append`). The `start` event's `stream_id` is captured for outbound frames.
+4. Model audio: OpenAI (`response.output_audio.delta`) → Hermes → Inkbox `media` frames tagged `track: "outbound"` with the `stream_id`. `response.output_audio.done` emits an `audio_done` frame; OpenAI `input_audio_buffer.speech_started` (caller barge-in) emits a `clear` frame to drop queued audio.
+5. The full resolved contact (name, emails, phones, company, notes) is loaded into the model's instructions at call start, so it knows who's calling without a mid-call lookup.
 5. Tool calls: `response.function_call_arguments.done` → adapter callback → `submitToolResult` via `conversation.item.create` + `response.create`.
 6. On `hermes_agent_consult`, the bridge fires an interim "Say only 'One moment.'" instruction so the model fills dead air while the spawned `hermes -z` invocation runs.
 

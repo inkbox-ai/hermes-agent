@@ -2308,6 +2308,7 @@ class InkboxAdapter(BasePlatformAdapter):
                         )
                     except Exception:
                         identity_for_meta = None
+                rt_contact = meta.get("contact") or {}
                 rt_meta = RealtimeCallMeta(
                     call_id=call_id or "unknown",
                     contact_id=str(contact_id),
@@ -2324,8 +2325,14 @@ class InkboxAdapter(BasePlatformAdapter):
                         "number",
                         None,
                     ) if identity_for_meta is not None else None,
+                    contact_emails=list(rt_contact.get("emails") or []),
+                    contact_phones=list(rt_contact.get("phones") or []),
+                    contact_company=rt_contact.get("company") or None,
+                    contact_notes=rt_contact.get("notes") or None,
                     outbound_purpose=str(call_context.get("purpose") or "") or None,
-                    outbound_opening=str(call_context.get("opening_message") or "") or None,
+                    outbound_opening=str(
+                        call_context.get("opening_message")
+                        or call_context.get("opening_line") or "") or None,
                     outbound_reason=str(call_context.get("reason") or "") or None,
                     outbound_scheduled_by=str(call_context.get("scheduled_by") or "") or None,
                     outbound_conversation_summary=str(

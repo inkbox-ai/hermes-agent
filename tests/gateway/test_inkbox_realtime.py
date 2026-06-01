@@ -103,6 +103,26 @@ class TestBuildInstructions:
         text = build_realtime_instructions(_meta(contact_name="unknown"))
         assert "No matching contact record" in text
 
+    def test_full_contact_is_rendered_so_no_lookup_needed(self):
+        text = build_realtime_instructions(_meta(
+            contact_name="Dima Vremenko",
+            contact_emails=["dima@vectorly.app", "dima@inkbox.ai"],
+            contact_phones=["+15167251294"],
+            contact_company="Inkbox",
+            contact_notes="Cofounder. Prefers SMS.",
+        ))
+        assert "dima@vectorly.app" in text
+        assert "dima@inkbox.ai" in text
+        assert "+15167251294" in text
+        assert "Inkbox" in text
+        assert "Cofounder. Prefers SMS." in text
+        # Must instruct the model NOT to re-look-up what it already has.
+        assert "do NOT look them up" in text
+
+    def test_known_contact_with_no_extra_fields_still_works(self):
+        text = build_realtime_instructions(_meta(contact_name="Alex"))
+        assert "Caller name: Alex" in text
+
     def test_outbound_call_includes_purpose_and_opening(self):
         text = build_realtime_instructions(_meta(
             direction="outbound",
@@ -183,6 +203,120 @@ class TestGreeting:
         assert "output_modalities" not in ws.sent[0]["response"]
         assert "instructions" in ws.sent[0]["response"]
         assert state.greeting_triggered is True
+
+
+# ─── media bridge parity (Inkbox media protocol) ───────────────────────────
+
+
+class _FakeMsg:
+    def __init__(self, data):
+        import aiohttp
+        self.type = aiohttp.WSMsgType.TEXT
+        self.data = data
+
+
+class _FakeOpenAIWS:
+    """Async-iterable fake yielding pre-canned OpenAI Realtime frames."""
+
+    def __init__(self, frames):
+        self._frames = [_FakeMsg(json.dumps(f)) for f in frames]
+
+    def __aiter__(self):
+        self._it = iter(self._frames)
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
+class TestMediaBridgeParity:
+    @pytest.mark.asyncio
+    async def test_outbound_media_has_track_and_stream_id(self):
+        from gateway.platforms.inkbox_realtime import _openai_to_inkbox_pump
+        inkbox_ws = _FakeWS()
+        openai_ws = _FakeOpenAIWS([
+            {"type": "response.output_audio.delta", "delta": "AAAA"},
+        ])
+        state = _BridgeState()
+        state.stream_id = "stream-xyz"
+
+        async def _noop(*_a, **_k):
+            return ""
+
+        await _openai_to_inkbox_pump(
+            openai_ws=openai_ws, inkbox_ws=inkbox_ws, state=state,
+            config=RealtimeConfig(enabled=True, api_key="sk-x"),
+            meta=_meta(), on_agent_consult=_noop,
+        )
+        media = [f for f in inkbox_ws.sent if f.get("event") == "media"]
+        assert len(media) == 1
+        assert media[0]["media"]["payload"] == "AAAA"
+        assert media[0]["media"]["track"] == "outbound"
+        assert media[0]["stream_id"] == "stream-xyz"
+
+    @pytest.mark.asyncio
+    async def test_audio_done_and_clear_are_emitted(self):
+        from gateway.platforms.inkbox_realtime import _openai_to_inkbox_pump
+        inkbox_ws = _FakeWS()
+        openai_ws = _FakeOpenAIWS([
+            {"type": "response.output_audio.done"},
+            {"type": "input_audio_buffer.speech_started"},
+        ])
+        state = _BridgeState()
+        state.stream_id = "s1"
+
+        async def _noop(*_a, **_k):
+            return ""
+
+        await _openai_to_inkbox_pump(
+            openai_ws=openai_ws, inkbox_ws=inkbox_ws, state=state,
+            config=RealtimeConfig(enabled=True, api_key="sk-x"),
+            meta=_meta(), on_agent_consult=_noop,
+        )
+        events = [f.get("event") for f in inkbox_ws.sent]
+        assert "audio_done" in events
+        assert "clear" in events
+        done = next(f for f in inkbox_ws.sent if f.get("event") == "audio_done")
+        assert done["stream_id"] == "s1"
+
+
+# ─── post-call dispatch (no double side effects) ────────────────────────────
+
+
+class TestPostCallDispatch:
+    @pytest.mark.asyncio
+    async def test_queued_actions_run_and_call_ended_skipped(self):
+        from gateway.platforms.inkbox_realtime import _dispatch_post_call
+        state = _BridgeState()
+        state.post_call_actions = [{"action": "Email Dima", "details": ""}]
+        calls = {"actions": 0, "ended": 0}
+
+        async def _actions(*_a, **_k):
+            calls["actions"] += 1
+
+        async def _ended(*_a, **_k):
+            calls["ended"] += 1
+
+        await _dispatch_post_call(state, _meta(), _actions, _ended)
+        assert calls == {"actions": 1, "ended": 0}
+
+    @pytest.mark.asyncio
+    async def test_no_actions_runs_call_ended_reflection(self):
+        from gateway.platforms.inkbox_realtime import _dispatch_post_call
+        state = _BridgeState()  # no post_call_actions
+        calls = {"actions": 0, "ended": 0}
+
+        async def _actions(*_a, **_k):
+            calls["actions"] += 1
+
+        async def _ended(*_a, **_k):
+            calls["ended"] += 1
+
+        await _dispatch_post_call(state, _meta(), _actions, _ended)
+        assert calls == {"actions": 0, "ended": 1}
 
 
 # ─── bearer resolution (api key vs OAuth client-secret mint) ────────────────

@@ -155,6 +155,12 @@ class RealtimeCallMeta:
     direction: str  # "inbound" or "outbound"
     agent_identity_email: Optional[str] = None
     agent_identity_phone: Optional[str] = None
+    # Full resolved contact record so the model knows who it's talking to
+    # without a mid-call lookup.
+    contact_emails: List[str] = field(default_factory=list)
+    contact_phones: List[str] = field(default_factory=list)
+    contact_company: Optional[str] = None
+    contact_notes: Optional[str] = None
     outbound_purpose: Optional[str] = None
     outbound_opening: Optional[str] = None
     # Richer outbound-call context loaded from the call-context file
@@ -209,6 +215,9 @@ class _BridgeState:
     last_response_id: Optional[str] = None
     closed: bool = False
     greeting_triggered: bool = False
+    # Inkbox-assigned stream id from the `start` event; echoed on outbound
+    # media / audio_done frames.
+    stream_id: Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -235,9 +244,21 @@ def build_realtime_instructions(
     if meta.agent_identity_phone:
         lines.append(f"Your phone number: {meta.agent_identity_phone}.")
     if meta.remote_phone_number:
-        lines.append(f"Caller phone number: {meta.remote_phone_number}.")
+        lines.append(f"Caller is calling from: {meta.remote_phone_number}.")
     if meta.contact_name and meta.contact_name not in ("unknown", ""):
+        lines.append(
+            "You already know who this is — do NOT look them up or ask for "
+            "details you already have below.",
+        )
         lines.append(f"Caller name: {meta.contact_name}.")
+        if meta.contact_emails:
+            lines.append(f"Caller email(s): {', '.join(meta.contact_emails)}.")
+        if meta.contact_phones:
+            lines.append(f"Caller phone(s) on file: {', '.join(meta.contact_phones)}.")
+        if meta.contact_company:
+            lines.append(f"Caller company: {meta.contact_company}.")
+        if meta.contact_notes:
+            lines.append(f"Notes about the caller: {meta.contact_notes}")
     else:
         lines.append(
             "No matching contact record is loaded; use the phone number or a neutral greeting.",
@@ -432,25 +453,33 @@ async def run_inkbox_realtime_bridge(
             except Exception:
                 pass
 
-        # Dispatch any queued post-call actions outside the call WS lifecycle.
-        if state.post_call_actions:
-            try:
-                await on_post_call_actions(
-                    meta, state.post_call_actions, list(state.transcript),
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[Inkbox realtime] Post-call action dispatch failed: %s", exc,
-                )
+        await _dispatch_post_call(state, meta, on_post_call_actions, on_call_ended)
+    finally:
+        await session.close()
 
+
+async def _dispatch_post_call(
+    state: _BridgeState,
+    meta: RealtimeCallMeta,
+    on_post_call_actions: "PostCallActionsCallback",
+    on_call_ended: "CallEndedCallback",
+) -> None:
+    """Dispatch exactly ONE follow-up turn after a call ends.
+
+    Queued post-call actions take priority; otherwise the generic
+    [call_ended] reflection runs. Running both can double-execute the same
+    commitment (two agent turns each sending the same email/SMS).
+    """
+    if state.post_call_actions:
+        try:
+            await on_post_call_actions(meta, state.post_call_actions, list(state.transcript))
+        except Exception as exc:
+            logger.warning("[Inkbox realtime] Post-call action dispatch failed: %s", exc)
+    else:
         try:
             await on_call_ended(meta, list(state.transcript))
         except Exception as exc:
-            logger.warning(
-                "[Inkbox realtime] Call-ended dispatch failed: %s", exc,
-            )
-    finally:
-        await session.close()
+            logger.warning("[Inkbox realtime] Call-ended dispatch failed: %s", exc)
 
 
 async def _resolve_realtime_bearer(
@@ -584,6 +613,7 @@ async def _inkbox_to_openai_pump(
                 continue
             event = (frame.get("event") or "").lower()
             if event == "start":
+                state.stream_id = frame.get("stream_id") or state.stream_id
                 await _maybe_send_greeting(openai_ws, state, meta)
             elif event == "media":
                 if not state.greeting_triggered:
@@ -632,23 +662,41 @@ async def _openai_to_inkbox_pump(
             continue
         ftype = frame.get("type", "")
 
-        # GA models emit ``response.output_audio.delta``; the older beta
-        # models emit ``response.audio.delta``. Handle both so the bridge
-        # works regardless of which model the operator configures.
+        # GA emits ``response.output_audio.delta``; beta ``response.audio.delta``.
         if ftype in ("response.output_audio.delta", "response.audio.delta"):
-            # Audio bytes are already μ-law base64. Forward as an Inkbox media
-            # frame. Streaming is handled by the realtime model's pacing; we
-            # don't need our own jitter buffer for telephony @ 8 kHz.
+            # Already μ-law base64. Forward as an outbound Inkbox media frame,
+            # echoing the stream_id and tagging the track per the Inkbox media
+            # protocol.
             delta_b64 = frame.get("delta") or ""
             if delta_b64:
+                out = {
+                    "event": "media",
+                    "media": {"payload": delta_b64, "track": "outbound"},
+                }
+                if state.stream_id:
+                    out["stream_id"] = state.stream_id
                 try:
-                    await inkbox_ws.send_str(json.dumps({
-                        "event": "media",
-                        "media": {"payload": delta_b64},
-                    }))
+                    await inkbox_ws.send_str(json.dumps(out))
                 except Exception as exc:
                     logger.debug("[Inkbox realtime] Inkbox WS send failed: %s", exc)
                     return
+
+        # Outbound audio for a response finished — tell Inkbox to flush/play.
+        elif ftype in ("response.output_audio.done", "response.audio.done"):
+            done = {"event": "audio_done"}
+            if state.stream_id:
+                done["stream_id"] = state.stream_id
+            try:
+                await inkbox_ws.send_str(json.dumps(done))
+            except Exception:
+                pass
+
+        # Caller started speaking (barge-in) — drop any queued outbound audio.
+        elif ftype == "input_audio_buffer.speech_started":
+            try:
+                await inkbox_ws.send_str(json.dumps({"event": "clear"}))
+            except Exception:
+                pass
 
         # GA: response.output_audio_transcript.done; beta: response.audio_transcript.done
         elif ftype in (
