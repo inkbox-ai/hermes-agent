@@ -55,10 +55,6 @@ DEFAULT_MODEL = "gpt-realtime-2"
 # "cedar" and "marin" are the recommended high-quality GA Realtime voices.
 DEFAULT_VOICE = "cedar"
 
-# OpenAI endpoint that exchanges an OAuth/ChatGPT access token for an
-# ephemeral Realtime client secret. Lets the bridge use the agent's existing
-# Codex/ChatGPT OAuth credentials instead of requiring a separate sk- API key.
-REALTIME_CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
 # Telephony audio is G.711 μ-law @ 8 kHz. The GA session schema expects an
 # audio-format *object*, not the legacy "g711_ulaw" string.
 AUDIO_FORMAT_TELEPHONY = {"type": "audio/pcmu"}
@@ -184,14 +180,10 @@ class RealtimeConfig:
     """
 
     enabled: bool = False
-    # Standard OpenAI Platform API key (sk-...). Used directly as the WS
-    # bearer when present.
+    # Standard OpenAI Platform API key (sk-...). GA Realtime authenticates the
+    # WebSocket with this key directly as the bearer — there is no longer an
+    # OAuth/client-secret exchange path.
     api_key: str = ""
-    # ChatGPT/Codex OAuth access token. When there's no api_key, this is
-    # exchanged for an ephemeral Realtime client secret (see
-    # _resolve_realtime_bearer). Lets the agent's existing Codex login drive
-    # realtime without a separate API key.
-    oauth_token: str = ""
     model: str = DEFAULT_MODEL
     voice: str = DEFAULT_VOICE
     additional_instructions: str = ""
@@ -201,7 +193,7 @@ class RealtimeConfig:
 
     @property
     def has_credential(self) -> bool:
-        return bool(self.api_key or self.oauth_token)
+        return bool(self.api_key)
 
 
 @dataclass
@@ -394,7 +386,7 @@ async def run_inkbox_realtime_bridge(
         logger.error("[Inkbox realtime] aiohttp not available; cannot open Realtime API WS")
         return
     if not config.has_credential:
-        logger.error("[Inkbox realtime] No OpenAI credential (api_key or oauth_token); refusing to bridge")
+        logger.error("[Inkbox realtime] No OpenAI API key; refusing to bridge")
         return
 
     state = _BridgeState()
@@ -492,36 +484,11 @@ async def _resolve_realtime_bearer(
 ) -> str:
     """Return the bearer to use on the Realtime WS.
 
-    Prefers a standard ``sk-`` API key. Otherwise exchanges the ChatGPT/Codex
-    OAuth token for an ephemeral Realtime client secret.
+    GA Realtime authenticates with a standard ``sk-`` API key directly; there
+    is no OAuth/client-secret exchange. ``session`` is retained for signature
+    compatibility with the bridge's call site.
     """
-    if config.api_key:
-        return config.api_key
-
-    body = {
-        "session": {
-            "type": "realtime",
-            "model": config.model,
-            "audio": {"output": {"voice": config.voice}},
-        },
-    }
-    headers = {
-        "Authorization": f"Bearer {config.oauth_token}",
-        "Content-Type": "application/json",
-    }
-    async with session.post(
-        REALTIME_CLIENT_SECRETS_URL, headers=headers, json=body,
-    ) as resp:
-        if resp.status >= 400:
-            detail = (await resp.text())[:200]
-            raise RuntimeError(f"client_secrets HTTP {resp.status}: {detail}")
-        data = await resp.json()
-    secret = data.get("value")
-    if not secret and isinstance(data.get("client_secret"), dict):
-        secret = data["client_secret"].get("value")
-    if not secret:
-        raise RuntimeError("client_secrets response had no value")
-    return str(secret)
+    return config.api_key
 
 
 async def _maybe_send_greeting(
