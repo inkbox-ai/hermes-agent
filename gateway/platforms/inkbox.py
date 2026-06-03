@@ -76,7 +76,6 @@ import re
 import socket as _socket
 import time
 from contextlib import suppress
-from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -918,21 +917,14 @@ class InkboxAdapter(BasePlatformAdapter):
             if rt_env is not None and rt_env.strip() != "":
                 rt_setting = rt_env.strip().lower() in ("true", "1", "yes")
 
+        # GA Realtime authenticates with a standard sk- API key only — the
+        # legacy Codex/ChatGPT OAuth → client-secret exchange no longer works.
         rt_api_key = (
             (rt_extra.get("api_key") or "").strip()
             or os.getenv("INKBOX_REALTIME_API_KEY", "").strip()
             or os.getenv("OPENAI_API_KEY", "").strip()
         )
-        # No sk- key? Fall back to the agent's ChatGPT/Codex OAuth token, which
-        # the bridge exchanges for an ephemeral Realtime client secret.
-        rt_oauth_token = ""
-        if not rt_api_key:
-            try:
-                from hermes_cli.auth import _pool_codex_access_token
-                rt_oauth_token = (_pool_codex_access_token() or "").strip()
-            except Exception:
-                rt_oauth_token = ""
-        rt_has_cred = bool(rt_api_key or rt_oauth_token)
+        rt_has_cred = bool(rt_api_key)
 
         if rt_setting is False:
             rt_enabled = False
@@ -941,23 +933,21 @@ class InkboxAdapter(BasePlatformAdapter):
             if not rt_has_cred:
                 logger.warning(
                     "[Inkbox] realtime voice was explicitly enabled but no OpenAI "
-                    "credential was found (checked realtime.api_key, "
-                    "INKBOX_REALTIME_API_KEY, OPENAI_API_KEY, Codex OAuth); falling "
+                    "API key was found (checked realtime.api_key, "
+                    "INKBOX_REALTIME_API_KEY, OPENAI_API_KEY); falling "
                     "back to Inkbox-side STT/TTS for calls.",
                 )
         else:
             rt_enabled = rt_has_cred
             if rt_enabled:
                 logger.info(
-                    "[Inkbox] realtime voice auto-enabled (%s present; set "
-                    "INKBOX_REALTIME_ENABLED=false to disable).",
-                    "API key" if rt_api_key else "Codex OAuth",
+                    "[Inkbox] realtime voice auto-enabled (OpenAI API key present; "
+                    "set INKBOX_REALTIME_ENABLED=false to disable).",
                 )
 
         self._realtime_config = RealtimeConfig(
             enabled=rt_enabled,
             api_key=rt_api_key,
-            oauth_token=rt_oauth_token,
             model=str(rt_extra.get("model") or os.getenv("INKBOX_REALTIME_MODEL") or REALTIME_DEFAULT_MODEL),
             voice=str(rt_extra.get("voice") or os.getenv("INKBOX_REALTIME_VOICE") or REALTIME_DEFAULT_VOICE),
             additional_instructions=str(rt_extra.get("additional_instructions") or ""),
@@ -2339,21 +2329,9 @@ class InkboxAdapter(BasePlatformAdapter):
                     outbound_conversation_summary=str(
                         call_context.get("conversation_summary") or "") or None,
                 )
-                # Refresh the Codex OAuth token per call (it expires/rotates);
-                # the cached __init__ value would go stale.
-                rt_config = self._realtime_config
-                if rt_config.enabled and not rt_config.api_key:
-                    fresh_token = ""
-                    try:
-                        from hermes_cli.auth import _pool_codex_access_token
-                        fresh_token = (_pool_codex_access_token() or "").strip()
-                    except Exception:
-                        fresh_token = rt_config.oauth_token
-                    if fresh_token:
-                        rt_config = replace(rt_config, oauth_token=fresh_token)
                 await run_inkbox_realtime_bridge(
                     inkbox_ws=ws,
-                    config=rt_config,
+                    config=self._realtime_config,
                     meta=rt_meta,
                     on_agent_consult=self._realtime_agent_consult,
                     on_post_call_actions=self._realtime_post_call_actions,

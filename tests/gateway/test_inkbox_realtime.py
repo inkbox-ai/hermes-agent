@@ -425,7 +425,7 @@ class TestPostCallDispatch:
         assert calls == {"actions": 0, "ended": 1}
 
 
-# ─── bearer resolution (api key vs OAuth client-secret mint) ────────────────
+# ─── bearer resolution (GA: API key used directly, no client-secret mint) ──
 
 
 class _FakePostCtx:
@@ -471,32 +471,17 @@ class TestBearerResolution:
         assert sess.calls == []  # no mint call when api_key present
 
     @pytest.mark.asyncio
-    async def test_oauth_mints_client_secret(self):
-        sess = _FakeSession(status=200, payload={"value": "ek-ephemeral"})
-        cfg = RealtimeConfig(enabled=True, oauth_token="oauth-tok", model="gpt-realtime-2")
+    async def test_no_api_key_returns_empty_and_never_mints(self):
+        # GA Realtime is API-key-only: with no key the bearer is empty and the
+        # bridge never posts to a client-secrets endpoint.
+        sess = _FakeSession()
+        cfg = RealtimeConfig(enabled=True)
         bearer = await _resolve_realtime_bearer(sess, cfg)
-        assert bearer == "ek-ephemeral"
-        assert len(sess.calls) == 1
-        assert sess.calls[0]["headers"]["Authorization"] == "Bearer oauth-tok"
-        assert sess.calls[0]["json"]["session"]["type"] == "realtime"
-
-    @pytest.mark.asyncio
-    async def test_oauth_mint_nested_client_secret_value(self):
-        sess = _FakeSession(status=200, payload={"client_secret": {"value": "ek-nested"}})
-        cfg = RealtimeConfig(enabled=True, oauth_token="oauth-tok")
-        bearer = await _resolve_realtime_bearer(sess, cfg)
-        assert bearer == "ek-nested"
-
-    @pytest.mark.asyncio
-    async def test_oauth_mint_http_error_raises(self):
-        sess = _FakeSession(status=401, payload={"error": "bad token"})
-        cfg = RealtimeConfig(enabled=True, oauth_token="oauth-tok")
-        with pytest.raises(RuntimeError):
-            await _resolve_realtime_bearer(sess, cfg)
+        assert bearer == ""
+        assert sess.calls == []
 
     def test_has_credential_property(self):
         assert RealtimeConfig(api_key="sk-x").has_credential is True
-        assert RealtimeConfig(oauth_token="tok").has_credential is True
         assert RealtimeConfig().has_credential is False
 
 
@@ -749,7 +734,7 @@ class TestDispatchUnknownTool:
 
 
 class TestAdapterRealtimeConfig:
-    def _make(self, monkeypatch, extra_overrides=None, codex_token=""):
+    def _make(self, monkeypatch, extra_overrides=None):
         # Reuse the same _patch_sdk helper used by the broader inkbox test
         # suite so we don't double-mock the SDK here.
         from tests.gateway.test_inkbox import _patch_sdk
@@ -757,9 +742,6 @@ class TestAdapterRealtimeConfig:
         from gateway.platforms.inkbox import InkboxAdapter
 
         _patch_sdk(monkeypatch)
-        # Stub the Codex OAuth token lookup so tests don't read real auth.json.
-        import hermes_cli.auth as _auth
-        monkeypatch.setattr(_auth, "_pool_codex_access_token", lambda: codex_token)
         cfg = PlatformConfig(
             enabled=True,
             api_key="ApiKey_test",
@@ -813,32 +795,14 @@ class TestAdapterRealtimeConfig:
         assert adapter._realtime_config.api_key == "sk-test-abc"
 
     def test_realtime_explicit_enable_without_any_credential_falls_back(self, monkeypatch):
-        # enabled=true but no API key AND no Codex OAuth — stays disabled.
+        # enabled=true but no API key anywhere — GA Realtime is key-only, so
+        # it stays disabled and falls back to Inkbox STT/TTS.
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("INKBOX_REALTIME_API_KEY", raising=False)
         adapter = self._make(monkeypatch, extra_overrides={
             "realtime": {"enabled": True},
-        }, codex_token="")
+        })
         assert adapter._realtime_config.enabled is False
-
-    def test_realtime_auto_enables_on_codex_oauth(self, monkeypatch):
-        # No sk- key but the agent has a Codex OAuth token -> realtime on,
-        # oauth_token populated (the "proper OpenAI method" path).
-        monkeypatch.delenv("INKBOX_REALTIME_ENABLED", raising=False)
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        monkeypatch.delenv("INKBOX_REALTIME_API_KEY", raising=False)
-        adapter = self._make(monkeypatch, codex_token="codex-oauth-token")
-        assert adapter._realtime_config.enabled is True
-        assert adapter._realtime_config.api_key == ""
-        assert adapter._realtime_config.oauth_token == "codex-oauth-token"
-
-    def test_realtime_api_key_preferred_over_codex_oauth(self, monkeypatch):
-        monkeypatch.delenv("INKBOX_REALTIME_ENABLED", raising=False)
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-wins")
-        adapter = self._make(monkeypatch, codex_token="codex-oauth-token")
-        assert adapter._realtime_config.api_key == "sk-wins"
-        # When an API key is present we don't bother reading the OAuth token.
-        assert adapter._realtime_config.oauth_token == ""
 
     def test_config_extras_take_precedence_over_env(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
