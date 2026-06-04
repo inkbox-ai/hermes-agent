@@ -1626,6 +1626,77 @@ def _normalize_tui_toolsets(toolsets: object) -> list[str]:
         return [item for item in normalized if item]
 
 
+def _read_cgroup_memory_limit() -> Optional[int]:
+    """Return the container memory limit in bytes, or None if unconstrained.
+
+    Node's V8 heap is NOT cgroup-aware: with a flat ``--max-old-space-size=8192``
+    it happily grows the heap toward 8GB regardless of the container's real
+    memory limit.  In a Docker/k8s container capped below ~9-10GB, the cgroup
+    OOM-killer SIGKILLs Node before V8's own heap monitor ever fires — which
+    runs no JS handler, writes no ``[tui-parent]`` breadcrumb, and the user
+    sees only a bare gateway ``stdin EOF``.  Reading the real cgroup limit lets
+    us size the heap cap below it so V8 GCs/exits gracefully instead of being
+    reaped silently.
+
+    Checks cgroup v2 (``/sys/fs/cgroup/memory.max``) then v1
+    (``/sys/fs/cgroup/memory/memory.limit_in_bytes``).  A literal ``max`` (v2)
+    or the v1 "unlimited" sentinel (a huge near-INT64 value) means no limit.
+    """
+    candidates = (
+        "/sys/fs/cgroup/memory.max",  # cgroup v2
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
+    )
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+        except (OSError, ValueError):
+            continue
+        if raw == "max":
+            return None
+        if not raw:
+            # Blank/empty file: no usable value here. Fall through to the next
+            # candidate (don't mistake an empty v2 file for "unlimited").
+            continue
+        try:
+            limit = int(raw)
+        except ValueError:
+            continue
+        if limit <= 0:
+            continue
+        # cgroup v1 reports "unlimited" as a huge value (often
+        # 0x7FFFFFFFFFFFF000 ≈ 9.2 EB, sometimes PAGE_COUNTER_MAX). Anything
+        # at/above ~1 PB is effectively unconstrained — treat as no limit.
+        if limit >= (1 << 50):
+            return None
+        return limit
+    return None
+
+
+def _resolve_tui_heap_mb(default_mb: int = 8192) -> int:
+    """Pick a V8 ``--max-old-space-size`` (MB) that fits the container.
+
+    Returns ``default_mb`` (8192) when unconstrained or when the box is large
+    enough that 8GB fits.  In a memory-limited container, returns ~75% of the
+    cgroup limit so the heap + non-heap RSS stays under the cgroup ceiling,
+    clamped to a sane floor (1536MB — below this V8 GC-thrashes and the TUI
+    is barely usable).  Never exceeds ``default_mb``.
+    """
+    limit = _read_cgroup_memory_limit()
+    if not limit:
+        return default_mb
+    limit_mb = limit // (1024 * 1024)
+    # Leave headroom for non-heap RSS (Node internals, buffers, the Python
+    # gateway child shares the same cgroup): cap the heap at 75% of the limit.
+    sized = int(limit_mb * 0.75)
+    if sized >= default_mb:
+        return default_mb
+    # Floor so a tiny limit doesn't drive V8 into constant GC. If the container
+    # is smaller than the floor, honor the limit-derived value anyway (better a
+    # graceful V8 exit than a silent cgroup kill).
+    return max(1536, sized) if limit_mb > 2048 else sized
+
+
 def _launch_tui(
     resume_session_id: Optional[str] = None,
     tui_dev: bool = False,
@@ -1721,16 +1792,23 @@ def _launch_tui(
         env["HERMES_TUI_TOOL_PROGRESS"] = "off"
     if accept_hooks:
         env["HERMES_ACCEPT_HOOKS"] = "1"
-    # Guarantee an 8GB V8 heap for the TUI. Default node cap is ~1.5–4GB
+    # Guarantee a generous V8 heap for the TUI. Default node cap is ~1.5–4GB
     # depending on version and can fatal-OOM on long sessions with large
-    # transcripts / reasoning blobs. Token-level merge: respect any
+    # transcripts / reasoning blobs. We target 8GB on an unconstrained host,
+    # but V8 is NOT cgroup-aware: in a memory-limited Docker/k8s container a
+    # flat 8GB heap grows past the container limit and the cgroup OOM-killer
+    # SIGKILLs Node — running no JS handler, writing no breadcrumb, leaving the
+    # user with only a bare gateway `stdin EOF`. _resolve_tui_heap_mb() reads
+    # the real cgroup limit and sizes the cap below it so V8 GCs/exits
+    # gracefully (and the memory monitor's onCritical breadcrumb can fire)
+    # instead of being reaped silently. Token-level merge: respect any
     # user-supplied --max-old-space-size (they may have set it higher).
     # --expose-gc is *not* added here: Node rejects it in NODE_OPTIONS
     # ("--expose-gc is not allowed in NODE_OPTIONS") and refuses to start.
     # It is passed as a direct argv flag in _make_tui_argv() instead.
     _tokens = env.get("NODE_OPTIONS", "").split()
     if not any(t.startswith("--max-old-space-size=") for t in _tokens):
-        _tokens.append("--max-old-space-size=8192")
+        _tokens.append(f"--max-old-space-size={_resolve_tui_heap_mb()}")
     env["NODE_OPTIONS"] = " ".join(_tokens)
     # HERMES_TUI_RESUME is an internal hand-off from the Python wrapper to the
     # Ink app.  Because we start from os.environ.copy(), an exported/stale value
@@ -7948,6 +8026,59 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     return stash_ref
 
 
+def _clean_managed_worktree(git_cmd: list[str], cwd: Path) -> bool:
+    """Discard working-tree dirt on a managed (non-fork) clone.
+
+    On a managed install (%LOCALAPPDATA%\\hermes\\hermes-agent or
+    ~/.hermes/hermes-agent) the user never edits the source tree, so any
+    "dirty" state is pure git artifact: CRLF renormalization, npm lockfile
+    churn, or files left behind when a directory was deleted upstream (e.g.
+    apps/bootstrap-installer/). Stashing that dirt and re-applying it after a
+    pull is actively dangerous — the stash/restore cycle has been observed to
+    clobber freshly-pulled source files (apps/desktop/ deletion →
+    "[UNRESOLVED_ENTRY] Cannot resolve entry module index.html").
+
+    For a managed clone the correct move is to throw the dirt away with
+    ``git reset --hard HEAD`` + ``git clean -fd`` (mirroring install.ps1's
+    update path), NOT preserve it. Forks keep the stash machinery because
+    their local edits are intentional.
+
+    Returns True if the tree was cleaned (or was already clean), False on
+    a git failure (caller should fall back to the stash path).
+    """
+    status = subprocess.run(
+        git_cmd + ["status", "--porcelain"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if status.returncode != 0:
+        return False
+    if not status.stdout.strip():
+        return True
+
+    print("→ Discarding working-tree changes on managed clone before update...")
+    reset = subprocess.run(
+        git_cmd + ["reset", "--hard", "HEAD"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if reset.returncode != 0:
+        return False
+    # Drop untracked files too (e.g. orphaned build artifacts), but never
+    # touch ignored paths — node_modules, venv, build outputs, and the like
+    # are expensive to rebuild and not git-artifact dirt.
+    subprocess.run(
+        git_cmd + ["clean", "-fd"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    return True
+
+
+
 def _resolve_stash_selector(
     git_cmd: list[str], cwd: Path, stash_ref: str
 ) -> Optional[str]:
@@ -8434,6 +8565,48 @@ def _venv_scripts_dir() -> Path | None:
         return None
     scripts = venv_dir / ("Scripts" if _is_windows() else "bin")
     return scripts if scripts.is_dir() else None
+
+
+def _wait_for_interpreter_venv_ready(*, timeout: float = 15.0) -> bool:
+    """Ensure the venv hosting ``sys.executable`` has an intact ``pyvenv.cfg``.
+
+    During ``hermes update`` the managed-uv path can rebuild the project venv
+    (``rebuild_venv`` → ``shutil.rmtree`` + ``uv venv``) before the
+    desktop-rebuild and profile-skills-sync steps run. Both of those steps
+    spawn a child process with ``sys.executable``. If they fire while the venv
+    is mid-rewrite, the interpreter launcher finds the venv directory but no
+    ``pyvenv.cfg`` yet and aborts with the bare stderr line
+    ``No pyvenv.cfg file`` — surfacing as a spurious "Desktop build failed" /
+    "sync failed" on an update that otherwise succeeded.
+
+    A venv's ``pyvenv.cfg`` sits one level up from the interpreter's ``bin`` /
+    ``Scripts`` dir. If ``sys.executable`` is NOT a venv interpreter (no
+    sibling marker dir, e.g. a system Python on PATH), there is nothing to
+    wait for and we return True immediately. Otherwise we poll briefly for the
+    marker to (re)appear — the rewrite window is short — and return whether
+    it's present. Best-effort: never raises, callers proceed regardless.
+    """
+    try:
+        exe = Path(sys.executable).resolve()
+    except Exception:
+        return True
+
+    venv_dir = exe.parent.parent  # .../venv/{bin,Scripts}/python -> .../venv
+    bin_dir = venv_dir / ("Scripts" if _is_windows() else "bin")
+    if not bin_dir.is_dir():
+        # Not a venv-hosted interpreter — pyvenv.cfg is irrelevant.
+        return True
+
+    cfg = venv_dir / "pyvenv.cfg"
+    if cfg.is_file():
+        return True
+
+    deadline = _time.monotonic() + max(0.0, timeout)
+    while _time.monotonic() < deadline:
+        if cfg.is_file():
+            return True
+        _time.sleep(0.25)
+    return cfg.is_file()
 
 
 def _hermes_exe_shims(scripts_dir: Path) -> list[Path]:
@@ -9734,6 +9907,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
 
+    # On Windows, Git-for-Windows defaults to core.autocrlf=true, which
+    # renormalizes the repo's LF-only text files to CRLF in the working tree.
+    # On a managed, never-user-edited clone that makes tracked files read as
+    # "locally modified", which forces an autostash on every update (and the
+    # stash/restore cycle can clobber source files — see _stash_local_changes_
+    # if_needed below). Pin autocrlf=false so the dirt is never created. This
+    # mirrors what install.ps1's update path already does (PR #38239).
+    if sys.platform == "win32" and git_dir.exists():
+        subprocess.run(
+            git_cmd + ["config", "core.autocrlf", "false"],
+            cwd=PROJECT_ROOT,
+            check=False,
+            capture_output=True,
+        )
+
     # Discard npm lockfile churn before any stash/branch logic. npm rewrites
     # tracked package-lock.json files non-deterministically at install/build
     # time (platform-specific optional deps, ideallyInert annotations, etc.),
@@ -9811,8 +9999,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 else f"branch '{current_branch}'"
             )
             print(f"  ⚠ Currently on {label} — switching to {branch} for update...")
-            # Stash before checkout so uncommitted work isn't lost
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+            # Stash before checkout so uncommitted work isn't lost — but on a
+            # managed (non-fork) clone there's nothing to preserve, so discard
+            # git-artifact dirt instead (a dirty tree would otherwise block the
+            # checkout). Forks keep the stash so their edits survive.
+            if not is_fork and _clean_managed_worktree(git_cmd, PROJECT_ROOT):
+                auto_stash_ref = None
+            else:
+                auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
             checkout_result = subprocess.run(
                 git_cmd + ["checkout", branch],
                 cwd=PROJECT_ROOT,
@@ -9846,7 +10040,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
         else:
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+            # On a managed (non-fork) clone the user never edits the source
+            # tree, so any dirt is git artifact (CRLF, lockfile churn,
+            # upstream-deleted dirs). Throw it away rather than stash/restore
+            # it — the stash/restore cycle has clobbered freshly-pulled source
+            # (apps/desktop/ → "[UNRESOLVED_ENTRY] index.html"). Forks fall
+            # through to the stash path so their intentional edits survive.
+            if not is_fork and _clean_managed_worktree(git_cmd, PROJECT_ROOT):
+                auto_stash_ref = None
+            else:
+                auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
 
         prompt_for_restore = (
             auto_stash_ref is not None
@@ -10099,11 +10302,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
         has_desktop_app = _desktop_packaged_executable(desktop_dir) is not None or _desktop_dist_exists(desktop_dir)
         if (desktop_dir / "package.json").exists() and shutil.which("npm") and has_desktop_app:
             print("→ Checking if desktop app needs rebuilding...")
-            build_result = subprocess.run(
-                [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"],
-                cwd=PROJECT_ROOT,
-                check=False,
-            )
+            # The Python-dependency step above may have rebuilt the venv that
+            # hosts sys.executable. Wait for its pyvenv.cfg to settle before
+            # spawning, or the child interpreter aborts with "No pyvenv.cfg
+            # file" and the rebuild spuriously "fails" on a successful update.
+            _wait_for_interpreter_venv_ready()
+            _desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
+            # Stream the build output live (long Electron builds otherwise
+            # look hung). On the rare nonzero exit, retry once after waiting
+            # again for the venv — this covers a still-settling rebuild window
+            # the first wait didn't fully catch.
+            build_result = subprocess.run(_desktop_build_cmd, cwd=PROJECT_ROOT, check=False)
+            if build_result.returncode != 0 and _wait_for_interpreter_venv_ready():
+                build_result = subprocess.run(_desktop_build_cmd, cwd=PROJECT_ROOT, check=False)
             if build_result.returncode != 0:
                 print("  ⚠ Desktop build failed (non-fatal; run `hermes desktop` to retry)")
 
@@ -10159,6 +10370,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if all_profiles:
                 print()
                 print("→ Syncing bundled skills to all profiles...")
+                # seed_profile_skills spawns sys.executable; if the venv was
+                # just rebuilt above, wait for pyvenv.cfg before the loop so
+                # the children don't abort with "No pyvenv.cfg file".
+                _wait_for_interpreter_venv_ready()
                 for p in all_profiles:
                     try:
                         r = seed_profile_skills(p.path, quiet=True)
@@ -11807,14 +12022,22 @@ def cmd_dashboard(args):
 
     from hermes_cli.web_server import start_server
 
-    embedded_chat = args.tui or os.environ.get("HERMES_DASHBOARD_TUI") == "1"
+    # The in-browser Chat tab (the embedded TUI over PTY/WebSocket) is always
+    # available — the desktop app and the dashboard's own Chat tab both rely on
+    # the `/api/ws` + `/api/pty` sockets, so there is no reason to gate them.
     start_server(
         host=args.host,
         port=args.port,
         open_browser=not args.no_open,
         allow_public=getattr(args, "insecure", False),
-        embedded_chat=embedded_chat,
     )
+
+
+def cmd_dashboard_register(args):
+    """Register a self-hosted dashboard OAuth client with Nous Portal."""
+    from hermes_cli.dashboard_register import cmd_dashboard_register as _impl
+
+    _impl(args)
 
 
 def cmd_completion(args, parser=None):
@@ -12681,9 +12904,9 @@ def main():
     setup_parser.add_argument(
         "--portal",
         action="store_true",
-        help="One-shot Nous Portal setup: log in via OAuth, set Nous as the "
-        "inference provider, and opt into the Tool Gateway. Skips the "
-        "rest of the wizard.",
+        help="One-shot Nous Portal setup: log in via OAuth, pick a Nous "
+        "model, set Nous as the inference provider, and opt into the Tool "
+        "Gateway. Skips the rest of the wizard.",
     )
     setup_parser.set_defaults(func=cmd_setup)
 
@@ -15093,14 +15316,6 @@ Examples:
         help="Allow binding to non-localhost (DANGEROUS: exposes API keys on the network)",
     )
     dashboard_parser.add_argument(
-        "--tui",
-        action="store_true",
-        help=(
-            "Expose the in-browser Chat tab (embedded `hermes --tui` via PTY/WebSocket). "
-            "Alternatively set HERMES_DASHBOARD_TUI=1."
-        ),
-    )
-    dashboard_parser.add_argument(
         "--skip-build",
         action="store_true",
         help=(
@@ -15126,6 +15341,50 @@ Examples:
         help="List running hermes dashboard processes and exit",
     )
     dashboard_parser.set_defaults(func=cmd_dashboard)
+
+    # `hermes dashboard register` — register a self-hosted dashboard OAuth
+    # client with Nous Portal and write the client_id into ~/.hermes/.env.
+    # Nested subparser so bare `hermes dashboard` keeps launching the server
+    # (set_defaults(func=cmd_dashboard) above remains the default).
+    dashboard_subparsers = dashboard_parser.add_subparsers(
+        dest="dashboard_subcommand"
+    )
+    dashboard_register_parser = dashboard_subparsers.add_parser(
+        "register",
+        help="Register a self-hosted dashboard with Nous Portal (writes the OAuth client ID to .env)",
+        description=(
+            "Register this install as a self-hosted dashboard with your Nous "
+            "Portal account. Creates an OAuth client, writes "
+            "HERMES_DASHBOARD_OAUTH_CLIENT_ID into ~/.hermes/.env, and prints "
+            "how to engage the login gate. Requires being logged in (hermes setup)."
+        ),
+    )
+    dashboard_register_parser.add_argument(
+        "--name",
+        default=None,
+        help="Human-readable label for the dashboard (default: an auto-generated name)",
+    )
+    dashboard_register_parser.add_argument(
+        "--redirect-uri",
+        dest="redirect_uri",
+        default=None,
+        help=(
+            "Optional public HTTPS OAuth redirect URI for the dashboard, e.g. "
+            "https://hermes.example.com/auth/callback. Omit for localhost-only use."
+        ),
+    )
+    dashboard_register_parser.add_argument(
+        "--portal-url",
+        dest="portal_url",
+        default=None,
+        help=(
+            "Override the Nous Portal base URL for registration (default: the "
+            "portal you logged into). The access token must be valid at this "
+            "portal. Also settable via HERMES_DASHBOARD_PORTAL_URL. Mainly for "
+            "testing against a staging/preview portal."
+        ),
+    )
+    dashboard_register_parser.set_defaults(func=cmd_dashboard_register)
 
     # =========================================================================
     # desktop (a.k.a. gui) command

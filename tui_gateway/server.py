@@ -1582,11 +1582,31 @@ def _session_info(agent, session: dict | None = None) -> dict:
     ):
         reasoning_effort = str(reasoning_config.get("effort", "") or "")
     service_tier = getattr(agent, "service_tier", None) or ""
+    # Effective approval-bypass state — the same three sources that
+    # check_all_command_guards() ORs together: persistent config
+    # (approvals.mode=off), the process-scoped --yolo env, and the
+    # per-session flag. Reporting only the per-session flag here would lie to
+    # the desktop status bar (it would show YOLO "off" while approvals.mode=off
+    # silently auto-approves every dangerous command).
+    yolo = False
+    try:
+        from tools.approval import (
+            _YOLO_MODE_FROZEN,
+            _get_approval_mode,
+            is_session_yolo_enabled,
+        )
+
+        session_key = (session or {}).get("session_key")
+        session_yolo = bool(is_session_yolo_enabled(session_key)) if session_key else False
+        yolo = bool(_YOLO_MODE_FROZEN) or session_yolo or _get_approval_mode() == "off"
+    except Exception:
+        yolo = False
     info: dict = {
         "model": getattr(agent, "model", ""),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
         "fast": service_tier == "priority",
+        "yolo": yolo,
         "tools": {},
         "skills": {},
         "cwd": cwd,
@@ -4134,6 +4154,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
             approval_token = set_current_session_key(session["session_key"])
             session_tokens = _set_session_context(session["session_key"])
+            # The sudo password callback is thread-local (tools.terminal_tool
+            # _callback_tls), so wiring it on the build thread doesn't reach this
+            # turn thread — terminal sudo prompts would fall through to /dev/tty
+            # and hang the headless gateway. Re-wire here so the prompt routes to
+            # the sudo.request overlay. (secret capture is a module global, so
+            # re-running is a harmless no-op.)
+            _wire_callbacks(sid)
             cwd = _session_cwd(session)
             _register_session_cwd(session)
             cols = session.get("cols", 80)
@@ -5022,6 +5049,9 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"key": key, "value": nv})
 
     if key == "yolo":
+        # Per-session approval bypass — same scope as the TUI's Shift+Tab. This
+        # toggles ONLY this session's _session_yolo flag; it never writes the
+        # global approvals.mode, so it cannot change CLI / TUI / cron behavior.
         try:
             if session:
                 from tools.approval import (
@@ -5030,13 +5060,28 @@ def _(rid, params: dict) -> dict:
                     is_session_yolo_enabled,
                 )
 
-                current = is_session_yolo_enabled(session["session_key"])
-                if current:
+                raw = str(value or "").strip().lower()
+                if raw in {"1", "on", "true", "yes"}:
+                    enable_session_yolo(session["session_key"])
+                    nv = "1"
+                elif raw in {"0", "off", "false", "no"}:
                     disable_session_yolo(session["session_key"])
                     nv = "0"
                 else:
-                    enable_session_yolo(session["session_key"])
-                    nv = "1"
+                    current = is_session_yolo_enabled(session["session_key"])
+                    if current:
+                        disable_session_yolo(session["session_key"])
+                        nv = "0"
+                    else:
+                        enable_session_yolo(session["session_key"])
+                        nv = "1"
+                agent = session.get("agent")
+                if agent is not None:
+                    _emit(
+                        "session.info",
+                        params.get("session_id", ""),
+                        _session_info(agent, session),
+                    )
             else:
                 current = is_truthy_value(os.environ.get("HERMES_YOLO_MODE"))
                 if current:
